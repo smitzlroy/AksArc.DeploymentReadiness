@@ -13,7 +13,7 @@ Describe 'AksArc.DeploymentReadiness Module' {
         It 'Module manifest is valid' {
             $manifest = Test-ModuleManifest -Path (Join-Path $PSScriptRoot '..' 'AksArc.DeploymentReadiness.psd1')
             $manifest | Should -Not -BeNullOrEmpty
-            $manifest.Version | Should -Be '0.1.0'
+            $manifest.Version | Should -Be '0.2.0'
         }
 
         It 'Exports exactly 8 functions' {
@@ -44,9 +44,9 @@ Describe 'AksArc.DeploymentReadiness Module' {
             $endpoints | Should -Not -BeNullOrEmpty
         }
 
-        It 'Contains 45 endpoints' {
+        It 'Contains 86 endpoints' {
             $endpoints = Get-AksArcEndpointReference
-            $endpoints.Count | Should -Be 45
+            $endpoints.Count | Should -Be 86
         }
 
         It 'Each endpoint has required properties' {
@@ -61,9 +61,36 @@ Describe 'AksArc.DeploymentReadiness Module' {
         }
 
         It 'Filters by component' {
-            $aks = Get-AksArcEndpointReference -Component 'AKS Arc infra'
+            $aks = Get-AksArcEndpointReference -Component 'Azure Local AKS infra'
             $aks | Should -Not -BeNullOrEmpty
-            $aks | ForEach-Object { $_.component | Should -Be 'AKS Arc infra' }
+            $aks | ForEach-Object { $_.component | Should -Be 'Azure Local AKS infra' }
+        }
+
+        It 'Component filter is case-insensitive' {
+            $aks = Get-AksArcEndpointReference -Component 'azure local aks infra'
+            $aks | Should -Not -BeNullOrEmpty
+        }
+
+        It 'Contains expected upstream component names' {
+            $endpoints = Get-AksArcEndpointReference
+            $components = $endpoints | Select-Object -ExpandProperty component -Unique
+            $components | Should -Contain 'Azure Local AKS infra'
+            $components | Should -Contain 'Azure Local ARB infra'
+            $components | Should -Contain 'Azure Local Arc agent'
+            $components | Should -Contain 'Azure Local authentication'
+            $components | Should -Contain 'Azure Local deployment'
+        }
+
+        It 'Contains customer-specific endpoints' {
+            $endpoints = Get-AksArcEndpointReference
+            $customerSpecific = @($endpoints | Where-Object { $_.customerSpecific -eq $true })
+            $customerSpecific.Count | Should -Be 2
+        }
+
+        It 'Contains region-specific endpoints' {
+            $endpoints = Get-AksArcEndpointReference
+            $regionSpecific = @($endpoints | Where-Object { $_.regionSpecific -eq $true })
+            $regionSpecific.Count | Should -BeGreaterThan 0
         }
 
         It 'Filters by ArcGatewaySupported' {
@@ -153,6 +180,19 @@ Describe 'AksArc.DeploymentReadiness Module' {
         It 'Has BatchSize parameter with default 50' {
             $cmd = Get-Command Test-AksArcFleetReadiness
             $cmd.Parameters.ContainsKey('BatchSize') | Should -Be $true
+        }
+    }
+
+    Context 'Initialize-AksArcValidation' {
+
+        It 'Has ManagementNetwork parameter' {
+            $cmd = Get-Command Initialize-AksArcValidation
+            $cmd.Parameters.ContainsKey('ManagementNetwork') | Should -Be $true
+        }
+
+        It 'Has AksNetwork parameter' {
+            $cmd = Get-Command Initialize-AksArcValidation
+            $cmd.Parameters.ContainsKey('AksNetwork') | Should -Be $true
         }
     }
 

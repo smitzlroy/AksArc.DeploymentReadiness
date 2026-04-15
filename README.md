@@ -1,30 +1,37 @@
 # AksArc.DeploymentReadiness
 
 <p align="center">
-  <strong>Pre-deployment readiness validation for AKS Arc on Azure Local</strong>
+  <strong>Pre-deployment readiness validation for AKS Arc on Azure Local</strong><br/>
+  <em>v0.2.0 — 86 endpoints &bull; 7 cross-subnet ports &bull; 15 components</em>
 </p>
 
 <p align="center">
-  <a href="#-quick-start">Quick Start</a> &bull;
-  <a href="#-functions">Functions</a> &bull;
-  <a href="#-examples">Examples</a> &bull;
-  <a href="#-cicd-integration">CI/CD</a> &bull;
-  <a href="#-endpoint-reference">Endpoints</a> &bull;
-  <a href="#-contributing">Contributing</a>
+  <a href="https://www.powershellgallery.com/packages/AksArc.DeploymentReadiness"><img src="https://img.shields.io/powershellgallery/v/AksArc.DeploymentReadiness?label=PSGallery&color=blue" alt="PSGallery"></a>
+  <a href="https://www.powershellgallery.com/packages/AksArc.DeploymentReadiness"><img src="https://img.shields.io/powershellgallery/dt/AksArc.DeploymentReadiness?color=green" alt="Downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/smitzlroy/AksArc.DeploymentReadiness" alt="License"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> &bull;
+  <a href="#function-reference">Function Reference</a> &bull;
+  <a href="#examples">Examples</a> &bull;
+  <a href="#endpoint-reference">Endpoints</a> &bull;
+  <a href="#cicd-integration">CI/CD</a> &bull;
+  <a href="#troubleshooting">Troubleshooting</a>
 </p>
 
 ---
 
 ## What is this?
 
-A PowerShell module that answers the question: **"Is my Azure Local cluster ready for AKS Arc?"**
+A PowerShell module that answers: **"Is my Azure Local cluster ready for AKS Arc?"**
 
 It validates network connectivity, endpoint reachability, cluster health, Arc Resource Bridge status, and logical network configuration — then gives you a clear pass/fail report you can hand to your team or pipe into CI/CD.
 
-It also includes a **consolidated firewall endpoint reference** (45 endpoints + 7 cross-subnet ports) that you can export as CSV, JSON, or Markdown to hand directly to your network security team.
+It ships with a **consolidated firewall endpoint reference** (86 endpoints + 7 cross-subnet ports) sourced from [Azure/AzureStack-Tools](https://github.com/Azure/AzureStack-Tools/blob/master/HCI/EastUSendpoints/eastus-hci-endpoints.md) that you can export as CSV, JSON, or Markdown for your network security team.
 
 > [!NOTE]
-> This module is **not** a Microsoft-supported product. It is a community tool distributed under the [MIT License](LICENSE).
+> This is a **community tool** distributed under the [MIT License](LICENSE). Not a Microsoft-supported product.
 
 ---
 
@@ -41,12 +48,12 @@ It also includes a **consolidated firewall endpoint reference** (45 endpoints + 
 
 ## Installation
 
-**From PowerShell Gallery** *(once published)*:
+**From PowerShell Gallery:**
 ```powershell
 Install-Module AksArc.DeploymentReadiness -Scope CurrentUser
 ```
 
-**From this repo** *(clone and import)*:
+**From source:**
 ```powershell
 git clone https://github.com/smitzlroy/AksArc.DeploymentReadiness.git
 Import-Module ./AksArc.DeploymentReadiness/AksArc.DeploymentReadiness.psd1
@@ -54,21 +61,22 @@ Import-Module ./AksArc.DeploymentReadiness/AksArc.DeploymentReadiness.psd1
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
-### Scenario 1 — Single-site readiness check (run from an Azure Local node)
+### Single-site readiness check (run from an Azure Local node)
 
 ```powershell
 Import-Module AksArc.DeploymentReadiness
 
-# Step 1: Auto-discover cluster, ARB, custom location, and logical networks
-$ctx = Initialize-AksArcValidation
+# Auto-discover cluster, ARB, custom location, and logical networks
+# Use -ManagementNetwork / -AksNetwork to tag which LNET is which
+$ctx = Initialize-AksArcValidation -ManagementNetwork 'mgmt-lnet' -AksNetwork 'aks-lnet'
 
-# Step 2: Run all 6 readiness gates — export JUnit XML for your pipeline
+# Run all 6 readiness gates — export JUnit XML for your pipeline
 Test-AksArcDeploymentReadiness -Context $ctx -ExportPath readiness-results.xml
 ```
 
-### Scenario 2 — Get the firewall rules for your security team
+### Get the firewall rules for your security team
 
 ```powershell
 # Markdown table (great for wiki/email)
@@ -78,64 +86,208 @@ Export-AksArcFirewallRules -Path firewall-request.md -Region eastus -IncludeCros
 Export-AksArcFirewallRules -Path firewall-request.csv -Region eastus
 ```
 
-### Scenario 3 — Fleet-wide assessment (run from any workstation)
+### Fleet-wide assessment (run from any workstation)
 
 ```powershell
-# Authenticate with managed identity or service principal
 Connect-AksArcServicePrincipal -UseManagedIdentity
-
-# Assess all clusters tagged for Wave 1
 Test-AksArcFleetReadiness -ScopeByTag -TagName 'ReadinessRing' -TagValue 'Wave1' -ExportPath fleet.xml
 ```
 
 ---
 
-## 📦 Functions
+## Function Reference
 
-The module is organized into three tiers based on where you run them and what they do.
+### Tier 1 — Single-Site Readiness
 
-### Tier 1 — Single-Site Readiness *(run from an Azure Local node)*
+#### `Initialize-AksArcValidation`
 
-| Function | What it does |
+Auto-discovers the Azure Local cluster, Arc Resource Bridge, custom location, and logical networks. Returns a context object consumed by other functions.
+
+```powershell
+Initialize-AksArcValidation
+    [-SubscriptionId <string>]
+    [-ResourceGroupName <string>]
+    [-ClusterName <string>]
+    [-ManagementNetwork <string>]
+    [-AksNetwork <string>]
+```
+
+| Parameter | Description |
 |:---|:---|
-| `Initialize-AksArcValidation` | Auto-discovers the Azure Local cluster, ARB, custom location, and logical networks. Returns a context object used by other functions. |
-| `Test-AksArcDeploymentReadiness` | Runs **6 readiness gates**: cluster health, ARB, custom location, network connectivity, logical networks, cross-subnet ports. Outputs pass/fail per gate with remediation guidance. |
-| `Test-AksArcNetworkConnectivity` | Tests TCP/HTTPS/DNS reachability to all 45 required endpoints. Reports latency and errors per endpoint. |
+| `-SubscriptionId` | Azure subscription ID. Defaults to current `az account show`. |
+| `-ResourceGroupName` | Resource group containing the Azure Local cluster. Auto-detected if omitted. |
+| `-ClusterName` | Cluster name. Auto-detected via `az stack-hci cluster list` if omitted. |
+| `-ManagementNetwork` | Name of the logical network used for management traffic. If omitted, discovered LNETs are listed so you can identify them. |
+| `-AksNetwork` | Name of the logical network used for AKS workloads. If omitted, discovered LNETs are listed so you can identify them. |
 
-### Tier 2 — Endpoint Reference *(run from anywhere)*
-
-| Function | What it does |
-|:---|:---|
-| `Get-AksArcEndpointReference` | Returns the full endpoint list as filterable PowerShell objects. Filter by `-Component`, `-ArcGatewaySupported`, `-RequiredFor`. |
-| `Export-AksArcFirewallRules` | Exports firewall rules as `.csv`, `.json`, or `.md` — ready to attach to a change request. |
-
-### Tier 3 — Fleet Scale *(run from any workstation, queries ARM/ARG)*
-
-| Function | What it does |
-|:---|:---|
-| `Test-AksArcFleetReadiness` | Batch readiness assessment across multiple clusters via Azure Resource Graph. Supports tag-based scoping and batch processing. |
-| `Get-AksArcFleetProgress` | Fleet-wide summary: connected vs. disconnected clusters, AKS Arc cluster count, optional per-cluster detail. |
-
-### Authentication
-
-| Function | What it does |
-|:---|:---|
-| `Connect-AksArcServicePrincipal` | Logs into Azure using Service Principal, Managed Identity, or environment variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`). |
+**Output:** A context hashtable containing cluster metadata, ARB status, custom location, and LNET details — passed to `Test-AksArcDeploymentReadiness` via `-Context`.
 
 ---
 
-## 📖 Examples
+#### `Test-AksArcDeploymentReadiness`
 
-### Network connectivity test with filtering
+Runs **6 readiness gates** and reports pass/fail with remediation guidance:
+
+| Gate | What it checks |
+|:---|:---|
+| 1 — Cluster Health | Azure Local cluster provisioning state and connectivity |
+| 2 — Arc Resource Bridge | ARB provisioning state and running status |
+| 3 — Custom Location | Custom location exists and is provisioned |
+| 4 — Network Connectivity | TCP/DNS reachability to all 86 required endpoints |
+| 5 — Logical Networks | LNET provisioning state, subnet, VLAN, IP pool config; management vs. AKS classification |
+| 6 — Cross-Subnet Ports | Port requirements between management and AKS subnets |
+
+```powershell
+Test-AksArcDeploymentReadiness
+    -Context <hashtable>
+    [-Region <string>]
+    [-SkipNetworkTests]
+    [-PassThru]
+    [-ExportPath <string>]    # .csv, .json, or .xml (JUnit)
+```
+
+| Parameter | Description |
+|:---|:---|
+| `-Context` | **Required.** Output from `Initialize-AksArcValidation`. |
+| `-Region` | Azure region for resolving region-specific endpoints (e.g., `eastus`). Strongly recommended. |
+| `-SkipNetworkTests` | Skip Gate 4 (network connectivity) for faster structural-only validation. |
+| `-PassThru` | Return result objects to the pipeline. |
+| `-ExportPath` | Export results to `.csv`, `.json`, or `.xml` (JUnit format). |
+
+---
+
+#### `Test-AksArcNetworkConnectivity`
+
+Tests TCP/HTTPS/DNS reachability to all 86 required endpoints individually.
+
+```powershell
+Test-AksArcNetworkConnectivity
+    [-Component <string>]
+    [-Region <string>]
+    [-TimeoutMs <int>]        # Default: 5000
+    [-PassThru]
+    [-ExportPath <string>]
+```
+
+| Parameter | Description |
+|:---|:---|
+| `-Component` | Filter by component name (case-insensitive substring match). See [Component Names](#component-names). |
+| `-Region` | **Strongly recommended.** Resolves region-specific endpoints. If omitted, 11 region-specific endpoints are skipped with a warning. |
+| `-TimeoutMs` | TCP connection timeout in milliseconds. Default: 5000. |
+| `-PassThru` | Return per-endpoint result objects to the pipeline. |
+| `-ExportPath` | Export results to `.csv`, `.json`, or `.xml`. |
+
+---
+
+### Tier 2 — Endpoint Reference
+
+#### `Get-AksArcEndpointReference`
+
+Returns the full endpoint list as filterable PowerShell objects.
+
+```powershell
+Get-AksArcEndpointReference
+    [-Component <string>]
+    [-ArcGatewaySupported <bool>]
+    [-RequiredFor <string>]        # deployment | post-deployment | both
+    [-Region <string>]
+    [-IncludeCrossSubnetPorts]
+    [-CheckForUpdates]
+```
+
+| Parameter | Description |
+|:---|:---|
+| `-Component` | Case-insensitive substring filter. E.g., `'AKS'` matches `Azure Local AKS infra`. |
+| `-ArcGatewaySupported` | `$true` = endpoints covered by Arc Gateway. `$false` = require direct firewall rules. |
+| `-RequiredFor` | `deployment`, `post-deployment`, or `both`. |
+| `-Region` | Resolves region-specific URLs in the output. |
+| `-IncludeCrossSubnetPorts` | Append cross-subnet port requirements to the output. |
+| `-CheckForUpdates` | Warns if the embedded endpoint data is older than 90 days. |
+
+---
+
+#### `Export-AksArcFirewallRules`
+
+Exports firewall rules as `.csv`, `.json`, or `.md` for change requests.
+
+```powershell
+Export-AksArcFirewallRules
+    -Path <string>                 # Required. File extension determines format.
+    [-Region <string>]
+    [-RequiredFor <string>]
+    [-IncludeCrossSubnetPorts]
+```
+
+---
+
+### Tier 3 — Fleet Scale
+
+#### `Test-AksArcFleetReadiness`
+
+Batch readiness assessment across multiple clusters via Azure Resource Graph.
+
+```powershell
+Test-AksArcFleetReadiness
+    [-ClusterNames <string[]>]
+    [-ClusterResourceIds <string[]>]
+    [-ScopeByTag]
+    [-TagName <string>]            # Default: 'ReadinessRing'
+    [-TagValue <string>]
+    [-SubscriptionId <string>]
+    [-BatchSize <int>]             # Default: 50
+    [-PassThru]
+    [-ExportPath <string>]
+```
+
+---
+
+#### `Get-AksArcFleetProgress`
+
+Fleet-wide dashboard: connected vs. disconnected clusters, AKS Arc cluster count.
+
+```powershell
+Get-AksArcFleetProgress
+    [-ScopeByTag]
+    [-TagName <string>]
+    [-TagValue <string>]
+    [-SubscriptionId <string>]
+    [-Detailed]
+```
+
+---
+
+### Authentication
+
+#### `Connect-AksArcServicePrincipal`
+
+Logs into Azure for headless/CI scenarios.
+
+```powershell
+Connect-AksArcServicePrincipal
+    [-UseManagedIdentity]
+    [-ManagedIdentityClientId <string>]
+    [-ServicePrincipalId <string>]
+    [-ServicePrincipalSecret <string>]
+    [-TenantId <string>]
+```
+
+Also supports environment variables: `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`.
+
+---
+
+## Examples
+
+### Network connectivity with filtering
 
 ```powershell
 # Test only AKS Arc infrastructure endpoints
-Test-AksArcNetworkConnectivity -Component 'AKS Arc infra' -Region eastus
+Test-AksArcNetworkConnectivity -Component 'AKS infra' -Region eastus
 
-# Find which endpoints still need direct firewall rules (not covered by Arc Gateway)
-Get-AksArcEndpointReference -ArcGatewaySupported $false | Format-Table url, port, component
+# Find endpoints that still need direct firewall rules (not covered by Arc Gateway)
+Get-AksArcEndpointReference -ArcGatewaySupported $false |
+    Format-Table url, port, component
 
-# Pipe failures for further analysis
+# Capture failures for analysis
 $failed = Test-AksArcNetworkConnectivity -Region eastus -PassThru |
     Where-Object Status -eq 'Failed'
 $failed | Format-Table Url, Port, Detail
@@ -144,67 +296,67 @@ $failed | Format-Table Url, Port, Detail
 ### Full readiness with export
 
 ```powershell
-$ctx = Initialize-AksArcValidation -ClusterName 'mycluster'
+$ctx = Initialize-AksArcValidation -ClusterName 'mycluster' `
+    -ManagementNetwork 'mgmt-lnet' -AksNetwork 'aks-lnet'
 
-# JUnit XML — integrates with Azure DevOps and GitHub Actions test reporters
-Test-AksArcDeploymentReadiness -Context $ctx -ExportPath results.xml
+# JUnit XML for pipeline test reporters
+Test-AksArcDeploymentReadiness -Context $ctx -Region eastus -ExportPath results.xml
 
-# JSON — for programmatic consumption
+# JSON for programmatic consumption — filter to failures only
 Test-AksArcDeploymentReadiness -Context $ctx -ExportPath results.json -PassThru |
     Where-Object Status -eq 'Failed'
 
-# WhatIf — preview what gates would run without executing
+# WhatIf — preview what gates would run
 Test-AksArcDeploymentReadiness -Context $ctx -WhatIf
 ```
 
 ### Fleet operations
 
 ```powershell
-# Assess specific clusters by name
+# Assess specific clusters
 Test-AksArcFleetReadiness -ClusterNames @('site-east-01', 'site-west-02') -ExportPath fleet.csv
 
 # Assess by tag
 Test-AksArcFleetReadiness -ScopeByTag -TagName 'Environment' -TagValue 'Production'
 
-# Quick fleet dashboard
+# Fleet dashboard
 Get-AksArcFleetProgress -Detailed
 ```
 
-### Endpoint data freshness check
+### Endpoint data freshness
 
 ```powershell
-# Check if embedded endpoint data is getting stale (warns if > 90 days old)
+# Warns if embedded endpoint data is > 90 days old
 Get-AksArcEndpointReference -CheckForUpdates
 ```
 
 ---
 
-## Common Parameters
+## Endpoint Reference
 
-These parameters follow the same conventions as the [AzStackHci.ManageUpdates](https://github.com/NeilBird/Azure-Local/tree/main/AzStackHci.ManageUpdates) module:
+The module ships with **86 endpoints** and **7 cross-subnet ports** embedded in [`data/endpoints.json`](data/endpoints.json), sourced from [Azure/AzureStack-Tools commit 41f99d8](https://github.com/Azure/AzureStack-Tools/blob/41f99d8c8157225201ee31f0ccf93f2110391ec7/HCI/EastUSendpoints/eastus-hci-endpoints.md).
 
-| Parameter | Available on | Description |
-|:---|:---|:---|
-| `-PassThru` | `Test-*`, `Get-*` | Returns result objects to the pipeline instead of just console output |
-| `-ExportPath` | `Test-*` | Exports results to `.csv`, `.json`, or `.xml` (JUnit format) |
-| `-WhatIf` | `Test-AksArcDeploymentReadiness` | Previews which gates would run without executing them |
-| `-Region` | Network & endpoint functions | Resolves region-specific wildcard URLs (e.g., `*.his.arc.azure.com` → `eastus.his.arc.azure.com`) |
-| `-Component` | Network & endpoint functions | Filters endpoints by component (`AKS Arc infra`, `ARB infra`, `Arc agent`, etc.) |
-| `-ScopeByTag` | Fleet functions | Scopes cluster discovery by Azure resource tag |
+### Component Names
 
----
+Component names match upstream exactly:
 
-## 🔥 Endpoint Reference
-
-The module ships with a consolidated endpoint reference embedded at [`data/endpoints.json`](data/endpoints.json).
-
-| Category | Count |
-|:---|:---|
-| Required endpoints | 45 |
-| Cross-subnet ports | 7 |
-| Components covered | AKS Arc infra, ARB infra, Arc agent, Authentication, ARM, Monitoring, HCI infra, Azure services |
-
-**Sourced from**: [Microsoft Learn — AKS Arc network requirements](https://learn.microsoft.com/azure/aks/aksarc/aks-hci-network-requirements) and [Azure/AzureStack-Tools](https://github.com/Azure/AzureStack-Tools/tree/master/HCI) endpoint lists.
+| Component | Endpoints |
+|:---|:---:|
+| Azure Local AKS infra | 22 |
+| Azure Local ARB infra | 11 |
+| Azure Local Arc agent | 9 |
+| Azure Local monitoring | 9 |
+| Azure Local authentication | 7 |
+| Azure Local CRLs | 7 |
+| Azure Local deployment | 7 |
+| Azure Local diag and billing | 4 |
+| Azure Local Updates | 3 |
+| Azure Local benefits | 2 |
+| Azure Local Arc gateway | 1 |
+| Azure Local management | 1 |
+| Azure Local WAC | 1 |
+| Microsoft Defender | 1 |
+| Microsoft Update | 1 |
 
 ### Cross-Subnet Ports (Management ↔ AKS subnet)
 
@@ -217,6 +369,18 @@ The module ships with a consolidated endpoint reference embedded at [`data/endpo
 | 40343 | TCP | Arc Gateway (when enabled) |
 | 55000 | TCP | gRPC / Cloud Agent |
 | 65000 | TCP | Cloud Agent Authentication |
+
+### Region-Specific Endpoints
+
+11 of the 86 endpoints are region-specific (e.g., `eastus.dp.kubernetesconfiguration.azure.com`). Provide `-Region` to resolve them correctly. Without `-Region`, these are skipped with a warning.
+
+### Customer-Specific Endpoints
+
+Two endpoints require customer-specific values:
+- **Key Vault**: `<your-keyvault-name>.vault.azure.net` — replace with your deployment Key Vault
+- **Arc Gateway**: `<your-arc-gateway-id>.gw.arc.azure.com` — replace with your Arc Gateway endpoint ID
+
+These are flagged with `"customerSpecific": true` in the JSON and skipped during automated testing.
 
 ---
 
@@ -231,9 +395,9 @@ The module ships with a consolidated endpoint reference embedded at [`data/endpo
 
 ---
 
-## 🔄 CI/CD Integration
+## CI/CD Integration
 
-Ready-to-use pipeline templates are in the [`Automation-Pipeline-Examples/`](Automation-Pipeline-Examples/) folder.
+Ready-to-use pipeline templates are in [`Automation-Pipeline-Examples/`](Automation-Pipeline-Examples/).
 
 ### GitHub Actions
 
@@ -277,16 +441,55 @@ See full examples: [GitHub Actions](Automation-Pipeline-Examples/github-actions-
 
 ---
 
-## 📁 Module Structure
+## Troubleshooting
+
+### Module not found after Install-Module
+
+On machines with OneDrive folder redirection, PowerShell 5.1 may not include the OneDrive-redirected Documents path in `$env:PSModulePath`. Use **PowerShell 7** (`pwsh`) or import by full path:
+
+```powershell
+Import-Module "$env:USERPROFILE\OneDrive - Microsoft\Documents\PowerShell\Modules\AksArc.DeploymentReadiness\0.2.0\AksArc.DeploymentReadiness.psd1"
+```
+
+### Region-specific endpoints skipped
+
+If you see warnings about skipped region-specific endpoints, add `-Region`:
+
+```powershell
+Test-AksArcNetworkConnectivity -Region eastus
+```
+
+### Logical network not identified as management or AKS
+
+Use `-ManagementNetwork` and `-AksNetwork` on `Initialize-AksArcValidation`:
+
+```powershell
+$ctx = Initialize-AksArcValidation -ManagementNetwork 'infra-lnet' -AksNetwork 'workload-lnet'
+```
+
+If you're not sure which is which, omit both parameters — the module will list all discovered LNETs with their subnet, VLAN, and IP pool details.
+
+### Customer-specific endpoints
+
+Endpoints for Key Vault and Arc Gateway are customer-specific placeholders. They are skipped during automated testing. To validate them, test manually:
+
+```powershell
+Test-NetConnection yourvaultname.vault.azure.net -Port 443
+Test-NetConnection yourid.gw.arc.azure.com -Port 443
+```
+
+---
+
+## Module Structure
 
 ```
 AksArc.DeploymentReadiness/
-├── AksArc.DeploymentReadiness.psd1          # Module manifest
+├── AksArc.DeploymentReadiness.psd1          # Module manifest (v0.2.0)
 ├── AksArc.DeploymentReadiness.psm1          # All functions (single-file module)
 ├── data/
-│   └── endpoints.json                       # 45 endpoints + 7 cross-subnet ports
+│   └── endpoints.json                       # 86 endpoints + 7 cross-subnet ports
 ├── Tests/
-│   └── AksArc.DeploymentReadiness.Tests.ps1 # Pester test suite (22 tests)
+│   └── AksArc.DeploymentReadiness.Tests.ps1 # Pester test suite (28 tests)
 ├── Automation-Pipeline-Examples/
 │   ├── github-actions-fleet-readiness.yml   # GitHub Actions workflow
 │   └── azure-devops-fleet-readiness.yml     # Azure DevOps pipeline
@@ -297,20 +500,19 @@ AksArc.DeploymentReadiness/
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
-Pull requests are welcome! Before submitting:
+Pull requests are welcome. Before submitting:
 
 ```powershell
-# 1. Run the Pester test suite
+# Run the Pester test suite
 Invoke-Pester ./Tests/ -Output Detailed
 
-# 2. Run PSScriptAnalyzer
+# Run PSScriptAnalyzer
 Invoke-ScriptAnalyzer ./AksArc.DeploymentReadiness.psm1
 
-# 3. Verify import on both PowerShell versions
+# Verify import
 pwsh -c "Import-Module ./AksArc.DeploymentReadiness.psd1; Get-Command -Module AksArc.DeploymentReadiness"
-powershell -c "Import-Module ./AksArc.DeploymentReadiness.psd1; Get-Command -Module AksArc.DeploymentReadiness"
 ```
 
 ---
@@ -321,5 +523,5 @@ powershell -c "Import-Module ./AksArc.DeploymentReadiness.psd1; Get-Command -Mod
 
 ## Acknowledgments
 
-- Module structure inspired by [AzStackHci.ManageUpdates](https://github.com/NeilBird/Azure-Local/tree/main/AzStackHci.ManageUpdates) by Neil Bird
-- Endpoint data sourced from [Microsoft Learn — AKS Arc network requirements](https://learn.microsoft.com/azure/aks/aksarc/aks-hci-network-requirements)
+- Module patterns inspired by [AzStackHci.ManageUpdates](https://github.com/NeilBird/Azure-Local/tree/main/AzStackHci.ManageUpdates) by Neil Bird
+- Endpoint data sourced from [Azure/AzureStack-Tools](https://github.com/Azure/AzureStack-Tools/blob/master/HCI/EastUSendpoints/eastus-hci-endpoints.md)

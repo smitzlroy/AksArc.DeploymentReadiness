@@ -195,15 +195,29 @@ function Initialize-AksArcValidation {
     .PARAMETER ClusterName
         Azure Local cluster name. Auto-discovered if there is exactly one in the resource group.
 
+    .PARAMETER ManagementNetwork
+        Name of the logical network used for management traffic. Used to distinguish
+        management vs AKS networks in Gate 5 validation.
+
+    .PARAMETER AksNetwork
+        Name of the logical network used for AKS Arc workload VMs. Used to distinguish
+        management vs AKS networks in Gate 5 validation.
+
     .EXAMPLE
         $ctx = Initialize-AksArcValidation
+        Test-AksArcDeploymentReadiness -Context $ctx
+
+    .EXAMPLE
+        $ctx = Initialize-AksArcValidation -ManagementNetwork 'mgmt-lnet' -AksNetwork 'aks-lnet'
         Test-AksArcDeploymentReadiness -Context $ctx
     #>
     [CmdletBinding()]
     param(
         [string]$SubscriptionId,
         [string]$ResourceGroupName,
-        [string]$ClusterName
+        [string]$ClusterName,
+        [string]$ManagementNetwork,
+        [string]$AksNetwork
     )
 
     Write-Log '========================================' -Level Header
@@ -297,21 +311,34 @@ function Initialize-AksArcValidation {
     $lnets = if ($lnetRaw) { $lnetRaw | ConvertFrom-Json } else { @() }
     Write-Log "Logical Networks: $($lnets.Count) found" -Level Info
 
+    # Identify management vs AKS networks
+    if ($lnets.Count -gt 0 -and -not $ManagementNetwork -and -not $AksNetwork) {
+        Write-Log 'TIP: Use -ManagementNetwork and -AksNetwork to identify which logical network serves each role.' -Level Warning
+        Write-Log 'Discovered logical networks:' -Level Info
+        foreach ($l in $lnets) {
+            $subnet = if ($l.properties.subnets) { $l.properties.subnets[0].properties.addressPrefix } else { 'N/A' }
+            $vlan = if ($l.properties.subnets -and $l.properties.subnets[0].properties.vlan) { $l.properties.subnets[0].properties.vlan } else { 'none' }
+            Write-Log "  $($l.name) - Subnet: $subnet, VLAN: $vlan" -Level Info
+        }
+    }
+
     # Build context
     $ctx = [PSCustomObject]@{
-        SubscriptionId   = $account.id
-        SubscriptionName = $account.name
-        ResourceGroup    = $rg
-        Region           = $region
-        ClusterName      = $cluster.name
-        ClusterId        = $cluster.id
-        ArbName          = if ($arb) { $arb.name } else { $null }
-        ArbId            = if ($arb) { $arb.id } else { $null }
-        ArbStatus        = if ($arb) { $arb.status } else { $null }
-        CustomLocation   = if ($customLoc) { $customLoc.name } else { $null }
-        CustomLocationId = if ($customLoc) { $customLoc.id } else { $null }
-        LogicalNetworks  = $lnets
-        Timestamp        = (Get-Date -Format 'o')
+        SubscriptionId     = $account.id
+        SubscriptionName   = $account.name
+        ResourceGroup      = $rg
+        Region             = $region
+        ClusterName        = $cluster.name
+        ClusterId          = $cluster.id
+        ArbName            = if ($arb) { $arb.name } else { $null }
+        ArbId              = if ($arb) { $arb.id } else { $null }
+        ArbStatus          = if ($arb) { $arb.status } else { $null }
+        CustomLocation     = if ($customLoc) { $customLoc.name } else { $null }
+        CustomLocationId   = if ($customLoc) { $customLoc.id } else { $null }
+        LogicalNetworks    = $lnets
+        ManagementNetwork  = $ManagementNetwork
+        AksNetwork         = $AksNetwork
+        Timestamp          = (Get-Date -Format 'o')
     }
 
     Write-Log 'Initialization complete.' -Level Success
@@ -328,7 +355,9 @@ function Test-AksArcNetworkConnectivity {
         endpoint reference. Returns structured results per endpoint with latency and status.
 
     .PARAMETER Component
-        Filter by component: 'AKS Arc infra', 'ARB infra', 'Arc agent', 'Authentication', 'ARM', 'Monitoring', etc.
+        Filter by component name (case-insensitive, supports wildcards): 'Azure Local AKS infra',
+        'Azure Local ARB infra', 'Azure Local Arc agent', 'Azure Local authentication',
+        'Azure Local deployment', 'Azure Local monitoring', 'Azure Local CRLs', etc.
 
     .PARAMETER ArcGatewaySupported
         Filter to only endpoints covered by Arc Gateway ($true) or requiring direct firewall rules ($false).
@@ -368,12 +397,18 @@ function Test-AksArcNetworkConnectivity {
     $data = Get-EndpointData
     $endpoints = $data.endpoints
 
-    # Apply filters
+    # Apply filters (case-insensitive component match)
     if ($Component) {
-        $endpoints = @($endpoints | Where-Object { $_.component -eq $Component })
+        $endpoints = @($endpoints | Where-Object { $_.component -like $Component })
     }
     if ($null -ne $ArcGatewaySupported) {
         $endpoints = @($endpoints | Where-Object { $_.arcGatewaySupported -eq $ArcGatewaySupported })
+    }
+
+    # Warn about region-specific endpoints when no Region specified
+    $regionEndpoints = @($endpoints | Where-Object { $_.regionSpecific -eq $true })
+    if (-not $Region -and $regionEndpoints.Count -gt 0) {
+        Write-Log "WARNING: $($regionEndpoints.Count) endpoint(s) are region-specific but -Region was not specified. These will be tested as-is (eastus default) and may fail DNS if your cluster is in another region. Use -Region <yourRegion> for accurate results." -Level Warning
     }
 
     Write-Log "Testing $($endpoints.Count) endpoint(s)..." -Level Info
@@ -385,9 +420,15 @@ function Test-AksArcNetworkConnectivity {
 
     foreach ($ep in $endpoints) {
         $url = $ep.url
-        # Resolve region-specific URLs
-        if ($Region -and $ep.regionSpecific -and $url -match '^\*\.') {
-            $url = $url -replace '^\*', $Region
+        # Resolve region-specific URLs (replace region prefix for explicit region endpoints)
+        if ($Region -and $ep.regionSpecific) {
+            foreach ($pattern in $data.regionUrlPatterns) {
+                $regionPart = $pattern.pattern -replace '\{region\}', '([a-z0-9]+)'
+                if ($url -match "^$regionPart$") {
+                    $url = $pattern.pattern -replace '\{region\}', $Region
+                    break
+                }
+            }
         }
 
         $testHost = $url -replace '^\*\.', ''
@@ -647,12 +688,70 @@ function Test-AksArcDeploymentReadiness {
                 if ($lnetDetail) {
                     $lnetObj = $lnetDetail | ConvertFrom-Json
                     $provState = $lnetObj.properties.provisioningState
+
+                    # Determine role
+                    $role = 'unknown'
+                    if ($Context.ManagementNetwork -and $lnet.name -eq $Context.ManagementNetwork) {
+                        $role = 'management'
+                    } elseif ($Context.AksNetwork -and $lnet.name -eq $Context.AksNetwork) {
+                        $role = 'aks'
+                    }
+                    $roleLabel = if ($role -ne 'unknown') { " ($role)" } else { '' }
+
                     if ($provState -eq 'Succeeded') {
-                        $results += New-ValidationResult -Gate 'LogicalNetworks' -Check "LNET-$($lnet.name)" -Status 'Passed' -Message "Provisioned"
+                        $results += New-ValidationResult -Gate 'LogicalNetworks' -Check "LNET-$($lnet.name)" -Status 'Passed' -Message "Provisioned$roleLabel"
                     } else {
-                        $results += New-ValidationResult -Gate 'LogicalNetworks' -Check "LNET-$($lnet.name)" -Status 'Warning' -Message "Provisioning: $provState"
+                        $results += New-ValidationResult -Gate 'LogicalNetworks' -Check "LNET-$($lnet.name)" -Status 'Warning' -Message "Provisioning: $provState$roleLabel"
+                    }
+
+                    # Validate subnet configuration
+                    $subnets = $lnetObj.properties.subnets
+                    if ($subnets -and $subnets.Count -gt 0) {
+                        $subnet = $subnets[0]
+                        $prefix = $subnet.properties.addressPrefix
+                        $vlan = $subnet.properties.vlan
+                        $ipPools = $subnet.properties.ipAllocationMethod
+                        $routes = $subnet.properties.routeTable
+
+                        if (-not $prefix) {
+                            $results += New-ValidationResult -Gate 'LogicalNetworks' -Check "LNET-$($lnet.name)-Subnet" -Status 'Failed' `
+                                -Message "No address prefix configured$roleLabel" `
+                                -Remediation 'Logical network must have a valid subnet address prefix.'
+                        } else {
+                            Write-Log "  $($lnet.name): Subnet=$prefix, VLAN=$(if ($vlan) { $vlan } else { 'none' })$roleLabel" -Level Info
+                        }
+
+                        # Check IP pools for AKS network
+                        if ($role -eq 'aks') {
+                            $ipPools2 = $subnet.properties.ipPools
+                            if (-not $ipPools2 -or $ipPools2.Count -eq 0) {
+                                $results += New-ValidationResult -Gate 'LogicalNetworks' -Check "LNET-$($lnet.name)-IPPool" -Status 'Warning' `
+                                    -Message "AKS network has no IP pools defined" `
+                                    -Remediation 'AKS logical network should have IP address pools for VM allocation.'
+                            }
+                        }
+                    } else {
+                        $results += New-ValidationResult -Gate 'LogicalNetworks' -Check "LNET-$($lnet.name)-Subnet" -Status 'Warning' `
+                            -Message "No subnets configured$roleLabel" `
+                            -Remediation 'Logical network should have at least one subnet.'
                     }
                 }
+            }
+
+            # Check that both management and AKS networks are identified
+            if ($Context.ManagementNetwork -and $Context.AksNetwork) {
+                if ($Context.ManagementNetwork -eq $Context.AksNetwork) {
+                    $results += New-ValidationResult -Gate 'LogicalNetworks' -Check 'NetworkSeparation' -Status 'Warning' `
+                        -Message 'Management and AKS networks are the same logical network' `
+                        -Detail 'Single-subnet deployment detected. Cross-subnet ports are not applicable.'
+                } else {
+                    $results += New-ValidationResult -Gate 'LogicalNetworks' -Check 'NetworkSeparation' -Status 'Passed' `
+                        -Message "Management: $($Context.ManagementNetwork), AKS: $($Context.AksNetwork)"
+                }
+            } elseif (-not $Context.ManagementNetwork -and -not $Context.AksNetwork) {
+                $results += New-ValidationResult -Gate 'LogicalNetworks' -Check 'NetworkRoles' -Status 'Warning' `
+                    -Message 'Network roles not specified. Use -ManagementNetwork and -AksNetwork in Initialize-AksArcValidation.' `
+                    -Remediation 'Specify -ManagementNetwork and -AksNetwork to enable detailed subnet validation.'
             }
         } else {
             $results += New-ValidationResult -Gate 'LogicalNetworks' -Check 'LNETsExist' -Status 'Failed' `
@@ -763,7 +862,7 @@ function Get-AksArcEndpointReference {
     $endpoints = $data.endpoints
 
     if ($Component) {
-        $endpoints = @($endpoints | Where-Object { $_.component -eq $Component })
+        $endpoints = @($endpoints | Where-Object { $_.component -like $Component })
     }
     if ($null -ne $ArcGatewaySupported) {
         $endpoints = @($endpoints | Where-Object { $_.arcGatewaySupported -eq $ArcGatewaySupported })
@@ -772,13 +871,20 @@ function Get-AksArcEndpointReference {
         $endpoints = @($endpoints | Where-Object { $_.requiredFor -eq $RequiredFor -or $_.requiredFor -eq 'both' })
     }
 
-    # Resolve region URLs
+    # Resolve region URLs using regionUrlPatterns
     if ($Region) {
         $endpoints = $endpoints | ForEach-Object {
             $ep = $_
-            if ($ep.regionSpecific -and $ep.url -match '^\*\.') {
-                $resolved = $ep.url -replace '^\*', $Region
-                $ep | Add-Member -NotePropertyName 'resolvedUrl' -NotePropertyValue $resolved -PassThru
+            if ($ep.regionSpecific) {
+                $resolvedUrl = $ep.url
+                foreach ($pattern in $data.regionUrlPatterns) {
+                    $regionPart = $pattern.pattern -replace '\{region\}', '([a-z0-9]+)'
+                    if ($ep.url -match "^$regionPart$") {
+                        $resolvedUrl = $pattern.pattern -replace '\{region\}', $Region
+                        break
+                    }
+                }
+                $ep | Add-Member -NotePropertyName 'resolvedUrl' -NotePropertyValue $resolvedUrl -PassThru
             } else {
                 $ep | Add-Member -NotePropertyName 'resolvedUrl' -NotePropertyValue $ep.url -PassThru
             }
