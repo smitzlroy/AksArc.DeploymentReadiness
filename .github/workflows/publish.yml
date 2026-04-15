@@ -1,0 +1,58 @@
+# Publishes to PowerShell Gallery when a version tag (v*) is pushed.
+#
+# Usage:
+#   1. Bump ModuleVersion in AksArc.DeploymentReadiness.psd1
+#   2. Commit and push
+#   3. Tag: git tag v0.2.0 && git push origin v0.2.0
+#   4. This workflow runs automatically
+
+name: Publish to PSGallery
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Pester Tests
+        shell: pwsh
+        run: |
+          Import-Module ./AksArc.DeploymentReadiness.psd1 -Force
+          $result = Invoke-Pester ./Tests/ -Output Detailed -PassThru
+          if ($result.FailedCount -gt 0) {
+            throw "$($result.FailedCount) test(s) failed"
+          }
+
+  publish:
+    name: Publish Module
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag matches manifest version
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}' -replace '^v', ''
+          $manifest = Test-ModuleManifest ./AksArc.DeploymentReadiness.psd1
+          if ($manifest.Version.ToString() -ne $tag) {
+            throw "Tag version ($tag) does not match manifest version ($($manifest.Version)). Update ModuleVersion in .psd1 first."
+          }
+          Write-Host "Version match confirmed: $tag"
+
+      - name: Publish to PowerShell Gallery
+        shell: pwsh
+        env:
+          PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+        run: |
+          Publish-Module -Path . -NuGetApiKey $env:PSGALLERY_API_KEY -Verbose
+          Write-Host "Published version ${{ github.ref_name }} to PowerShell Gallery"
