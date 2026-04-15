@@ -1,0 +1,15 @@
+# PowerShell module build artifacts
+*.nupkg
+publish/
+
+# Test results
+*.xml
+!Automation-Pipeline-Examples/*.yml
+
+# IDE
+.vscode/
+*.code-workspace
+
+# OS
+Thumbs.db
+.DS_Store

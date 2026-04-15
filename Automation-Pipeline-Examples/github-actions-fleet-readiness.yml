@@ -1,0 +1,68 @@
+# AKS Arc Deployment Readiness - GitHub Actions
+# Runs fleet readiness assessment on a schedule or manual trigger.
+
+name: AKS Arc Fleet Readiness
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Every Monday at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      tag_value:
+        description: 'ReadinessRing tag value to scope clusters'
+        required: false
+        default: ''
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Module
+        shell: pwsh
+        run: |
+          Install-Module AksArc.DeploymentReadiness -Force -Scope CurrentUser
+
+      - name: Run Fleet Readiness
+        shell: pwsh
+        run: |
+          $params = @{
+            ExportPath = 'fleet-results.xml'
+            PassThru   = $true
+          }
+          $tagValue = '${{ github.event.inputs.tag_value }}'
+          if ($tagValue) {
+            $params['ScopeByTag'] = $true
+            $params['TagValue'] = $tagValue
+          }
+          $results = Test-AksArcFleetReadiness @params
+          $failed = @($results | Where-Object { -not $_.ReadyForAksArc })
+          if ($failed.Count -gt 0) {
+            Write-Host "##[warning]$($failed.Count) cluster(s) not ready for AKS Arc"
+            exit 1
+          }
+
+      - name: Publish Test Results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Fleet Readiness Results
+          path: fleet-results.xml
+          reporter: java-junit
+
+      - name: Upload Results Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-readiness-results
+          path: fleet-results.xml

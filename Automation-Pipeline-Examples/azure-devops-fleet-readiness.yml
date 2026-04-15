@@ -1,0 +1,61 @@
+# AKS Arc Deployment Readiness - Azure DevOps Pipeline
+# Runs readiness assessment with JUnit test reporting.
+
+trigger: none
+
+schedules:
+  - cron: '0 6 * * 1'
+    displayName: Weekly Monday 06:00 UTC
+    branches:
+      include:
+        - main
+
+parameters:
+  - name: tagValue
+    displayName: ReadinessRing tag value (leave empty for all clusters)
+    type: string
+    default: ''
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - task: AzureCLI@2
+    displayName: Run Fleet Readiness Assessment
+    inputs:
+      azureSubscription: '<your-service-connection>'  # Replace with your Azure DevOps service connection name
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        Install-Module AksArc.DeploymentReadiness -Force -Scope CurrentUser
+
+        $params = @{
+          ExportPath = '$(Build.ArtifactStagingDirectory)/fleet-results.xml'
+          PassThru   = $true
+        }
+        $tagValue = '$(tagValue)'
+        if ($tagValue) {
+          $params['ScopeByTag'] = $true
+          $params['TagValue'] = $tagValue
+        }
+
+        $results = Test-AksArcFleetReadiness @params
+        $failed = @($results | Where-Object { -not $_.ReadyForAksArc })
+        if ($failed.Count -gt 0) {
+          Write-Host "##vso[task.logissue type=warning]$($failed.Count) cluster(s) not ready"
+        }
+
+  - task: PublishTestResults@2
+    displayName: Publish Test Results
+    condition: always()
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: '$(Build.ArtifactStagingDirectory)/fleet-results.xml'
+      testRunTitle: AKS Arc Fleet Readiness
+
+  - task: PublishPipelineArtifact@1
+    displayName: Publish Results Artifact
+    condition: always()
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)/fleet-results.xml'
+      artifact: fleet-readiness-results
