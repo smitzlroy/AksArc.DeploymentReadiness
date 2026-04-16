@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     AksArc.DeploymentReadiness - Pre-deployment readiness validation for AKS Arc on Azure Local.
@@ -361,7 +361,7 @@ function Initialize-AksArcValidation {
     $lnets = if ($lnetRaw) { $lnetRaw | ConvertFrom-Json } else { @() }
     Write-Log "Logical Networks: $($lnets.Count) found" -Level Info
 
-    # Identify management vs AKS networks — interactive selection when not specified
+    # Identify management vs AKS networks - interactive selection when not specified
     if ($lnets.Count -gt 0 -and -not $ManagementNetwork -and -not $AksNetwork) {
         $isInteractive = [Environment]::UserInteractive -and -not $env:TF_BUILD -and -not $env:GITHUB_ACTIONS -and -not $env:SYSTEM_TEAMPROJECT
 
@@ -738,7 +738,7 @@ function New-AksArcDeploymentPlan {
     if ($autoScaleHeadroom -gt 0) {
         Write-Log "  Autoscale headroom:   $autoScaleHeadroom IPs (max $MaxAutoScaleNodes workers)" -Level Info
     }
-    Write-Log "  ─────────────────────────────────────" -Level Info
+    Write-Log "  -------------------------------------" -Level Info
     Write-Log "  IP pool required:     $totalRequiredIPs IPs" -Level Header
     Write-Log '' -Level Info
     Write-Log "Load balancer IPs:      $LoadBalancerIPs IPs (same subnet, OUTSIDE IP pool)" -Level Info
@@ -1087,7 +1087,7 @@ function Test-AksArcDeploymentReadiness {
                                                 -Remediation 'Ensure load balancer (MetalLB) IPs are in the same subnet but not overlapping with the IP pool.'
                                         }
                                     } else {
-                                        # No deployment plan — just report pool size
+                                        # No deployment plan - just report pool size
                                         $results += New-ValidationResult -Gate 'LogicalNetworks' -Check "LNET-$($lnet.name)-IPPool" -Status 'Passed' `
                                             -Message "IP pool has $totalPoolIPs IPs available. Use -DeploymentPlan to validate capacity."
                                     }
@@ -1098,7 +1098,7 @@ function Test-AksArcDeploymentReadiness {
                                 }
                             }
                         } elseif ($role -ne 'management') {
-                            # Non-designated network — just report IP pool presence
+                            # Non-designated network - just report IP pool presence
                             if ($ipPools -and $ipPools.Count -gt 0) {
                                 Write-Log "  $($lnet.name): IP pools present" -Level Info
                             }
@@ -1158,9 +1158,9 @@ function Test-AksArcDeploymentReadiness {
                 # Skip Arc Gateway port if not explicitly testing
                 if ($conditional -and $port -eq 40343) {
                     $results += New-ValidationResult -Gate 'ActivePortTest' -Check "Port${port}" -Status 'Skipped' `
-                        -Message "Port $port ($purpose) — skipped (conditional, Arc Gateway must be enabled)" `
+                        -Message "Port $port ($purpose) - skipped (conditional, Arc Gateway must be enabled)" `
                         -Detail 'Enable Arc Gateway and provide -ClusterIP to test this port.'
-                    Write-Log "  SKIP Port $port ($purpose) — conditional" -Level Info
+                    Write-Log "  SKIP Port $port ($purpose) - conditional" -Level Info
                     continue
                 }
 
@@ -1178,9 +1178,9 @@ function Test-AksArcDeploymentReadiness {
                 if (-not $targetIP) {
                     $missingParam = if ($testDir -eq 'toAks') { '-AksSubnetTestIP' } else { '-ClusterIP' }
                     $results += New-ValidationResult -Gate 'ActivePortTest' -Check "Port${port}" -Status 'Skipped' `
-                        -Message "Port $port ($purpose) — skipped ($missingParam not provided)" `
+                        -Message "Port $port ($purpose) - skipped ($missingParam not provided)" `
                         -Detail "Provide $missingParam on Initialize-AksArcValidation to enable this test."
-                    Write-Log "  SKIP Port $port ($purpose) — $missingParam not provided" -Level Info
+                    Write-Log "  SKIP Port $port ($purpose) - $missingParam not provided" -Level Info
                     continue
                 }
 
@@ -1189,20 +1189,20 @@ function Test-AksArcDeploymentReadiness {
                     $results += New-ValidationResult -Gate 'ActivePortTest' -Check "Port${port}" -Status 'Passed' `
                         -Message "Port $port ($purpose) reachable ($direction)" `
                         -Detail "TCP connection to ${targetIP}:$port succeeded in $($portResult.ResponseTimeMs)ms"
-                    Write-Log "  PASS Port $port ($purpose) — $direction" -Level Success
+                    Write-Log "  PASS Port $port ($purpose) - $direction" -Level Success
                 } else {
                     $errDetail = if ($portResult.Error) { $portResult.Error } else { 'Connection timed out or refused' }
                     $results += New-ValidationResult -Gate 'ActivePortTest' -Check "Port${port}" -Status 'Failed' `
                         -Message "Port $port ($purpose) NOT reachable ($direction)" `
                         -Remediation "Ensure firewall rules allow TCP/$port ($purpose) between management and AKS subnets. Target: ${targetIP}:$port. Error: $errDetail"
-                    Write-Log "  FAIL Port $port ($purpose) — $direction ($errDetail)" -Level Error
+                    Write-Log "  FAIL Port $port ($purpose) - $direction ($errDetail)" -Level Error
                 }
             }
         } else {
             $results += New-ValidationResult -Gate 'ActivePortTest' -Check 'PortTestSkipped' -Status 'Skipped' `
-                -Message 'Active cross-subnet port testing skipped — no target IPs provided' `
+                -Message 'Active cross-subnet port testing skipped - no target IPs provided' `
                 -Detail 'Provide -AksSubnetTestIP and/or -ClusterIP on Initialize-AksArcValidation to enable active port testing.'
-            Write-Log '  Skipped — provide -AksSubnetTestIP and/or -ClusterIP to enable active testing.' -Level Info
+            Write-Log '  Skipped - provide -AksSubnetTestIP and/or -ClusterIP to enable active testing.' -Level Info
         }
 
         # Gate 8: RBAC Permission Validation
@@ -1297,7 +1297,7 @@ function Test-AksArcDeploymentReadiness {
                 }
             }
 
-            # Check Reader role (warn — not sufficient for deployment)
+            # Check Reader role (warn - not sufficient for deployment)
             if ($roleNames -contains 'Reader' -and -not $hasSufficientRole) {
                 $results += New-ValidationResult -Gate 'RBAC' -Check 'ReaderRoleWarning' -Status 'Warning' `
                     -Message "Identity has Reader role but this is insufficient for AKS Arc deployment" `
@@ -1770,7 +1770,7 @@ function Test-AksArcFleetReadiness {
 
     $results = @()
 
-    # Collect per-cluster data — parallel when multiple clusters
+    # Collect per-cluster data - parallel when multiple clusters
     $clusterAssessments = @()
     if ($clusters.Count -gt 1 -and $ThrottleLimit -gt 1) {
         Write-Log "Collecting fleet data in parallel (throttle: $ThrottleLimit)..." -Level Info
@@ -1806,7 +1806,7 @@ function Test-AksArcFleetReadiness {
 
                 return $result
             } -ArgumentList $rg, $sub, $clId
-            # Throttle — wait if too many jobs running
+            # Throttle - wait if too many jobs running
             while (@($jobs | Where-Object { $_.State -eq 'Running' }).Count -ge $ThrottleLimit) {
                 $completed = $jobs | Where-Object { $_.State -eq 'Completed' } | Select-Object -First 1
                 if ($completed) { break }
