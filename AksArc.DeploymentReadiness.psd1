@@ -3,7 +3,7 @@
     # Generated on: 2026-04-15
 
     RootModule        = 'AksArc.DeploymentReadiness.psm1'
-    ModuleVersion     = '0.5.0'
+    ModuleVersion     = '0.6.0'
     GUID              = 'a3e7c1d9-4f2b-4e8a-9d6c-1b5f3e7a2c4d'
     Author            = 'smitzlroy'
     CompanyName       = 'Community'
@@ -37,7 +37,7 @@
             Tags         = @('AKS', 'AKS-Arc', 'Azure-Local', 'Azure-Stack-HCI', 'Readiness', 'Validation', 'Firewall', 'Endpoints', 'Fleet', 'OT')
             LicenseUri   = 'https://github.com/smitzlroy/AksArc.DeploymentReadiness/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/smitzlroy/AksArc.DeploymentReadiness'
-            ReleaseNotes = 'Initial release: single-site readiness, endpoint reference, fleet assessment.'
+            ReleaseNotes = 'v0.6.0: Interactive LNET selection, 8 readiness gates, 86 endpoints, IP capacity math, cross-VLAN port tests, RBAC checks, HTML reports, fleet assessment with parallel collection.'
         }
     }
 }

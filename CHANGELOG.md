@@ -5,6 +5,23 @@ All notable changes to the **AksArc.DeploymentReadiness** module will be documen
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-04-16
+
+### Added
+
+- **Interactive LNET selection** in `Initialize-AksArcValidation`: When logical networks are found and `-ManagementNetwork`/`-AksNetwork` are not specified, the function lists all discovered LNETs with subnet, VLAN, and IP pool details, then prompts you to select which is management and which is AKS. Single-LNET deployments get a simplified yes/no prompt.
+- **CI/CD fallback**: Non-interactive sessions (detected via `TF_BUILD`, `GITHUB_ACTIONS`, `SYSTEM_TEAMPROJECT` env vars) skip prompts and log a warning to use parameters explicitly.
+
+### Changed
+
+- LNET discovery listing now includes IP pool count per network.
+- Module version bumped to 0.6.0.
+- Updated `ReleaseNotes` in module manifest to reflect current feature set.
+
+### Fixed
+
+- Previous versions only logged a tip to use `-ManagementNetwork`/`-AksNetwork` parameters when LNETs were found without role assignment. This was easy to miss and left Gate 5 running in degraded mode.
+
 ## [0.5.0] - 2026-04-16
 
 ### Added

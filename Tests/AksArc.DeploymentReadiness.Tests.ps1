@@ -13,7 +13,7 @@ Describe 'AksArc.DeploymentReadiness Module' {
         It 'Module manifest is valid' {
             $manifest = Test-ModuleManifest -Path (Join-Path $PSScriptRoot '..' 'AksArc.DeploymentReadiness.psd1')
             $manifest | Should -Not -BeNullOrEmpty
-            $manifest.Version | Should -Be '0.5.0'
+            $manifest.Version | Should -Be '0.6.0'
         }
 
         It 'Exports exactly 10 functions' {
@@ -504,6 +504,39 @@ Describe 'AksArc.DeploymentReadiness Module' {
             $html = New-AksArcReadinessReport -Results $mockResults -OutputPath $path -PassThru
             $html | Should -Not -BeNullOrEmpty
             $html | Should -Match '<html'
+        }
+    }
+
+    Context 'Initialize-AksArcValidation interactive LNET selection' {
+
+        It 'Initialize-AksArcValidation still has ManagementNetwork parameter' {
+            $cmd = Get-Command Initialize-AksArcValidation
+            $cmd.Parameters.ContainsKey('ManagementNetwork') | Should -Be $true
+        }
+
+        It 'Initialize-AksArcValidation still has AksNetwork parameter' {
+            $cmd = Get-Command Initialize-AksArcValidation
+            $cmd.Parameters.ContainsKey('AksNetwork') | Should -Be $true
+        }
+
+        It 'ManagementNetwork and AksNetwork are optional (not mandatory)' {
+            $cmd = Get-Command Initialize-AksArcValidation
+            $cmd.Parameters['ManagementNetwork'].Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] } | ForEach-Object {
+                $_.Mandatory | Should -Be $false
+            }
+            $cmd.Parameters['AksNetwork'].Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] } | ForEach-Object {
+                $_.Mandatory | Should -Be $false
+            }
+        }
+
+        It 'ManagementNetwork accepts string type' {
+            $cmd = Get-Command Initialize-AksArcValidation
+            $cmd.Parameters['ManagementNetwork'].ParameterType | Should -Be ([string])
+        }
+
+        It 'AksNetwork accepts string type' {
+            $cmd = Get-Command Initialize-AksArcValidation
+            $cmd.Parameters['AksNetwork'].ParameterType | Should -Be ([string])
         }
     }
 }

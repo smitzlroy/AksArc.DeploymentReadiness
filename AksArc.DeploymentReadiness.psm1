@@ -203,6 +203,11 @@ function Initialize-AksArcValidation {
         ARB, custom location, and logical networks in the current subscription.
         Returns a context object used by other functions.
 
+        When logical networks are found but -ManagementNetwork and -AksNetwork are not
+        specified, the function lists all discovered LNETs and interactively prompts you
+        to select which is management and which is AKS. In non-interactive sessions
+        (CI/CD), use the parameters explicitly.
+
     .PARAMETER SubscriptionId
         Azure subscription ID. If not specified, uses the current az CLI context.
 
@@ -214,11 +219,13 @@ function Initialize-AksArcValidation {
 
     .PARAMETER ManagementNetwork
         Name of the logical network used for management traffic. Used to distinguish
-        management vs AKS networks in Gate 5 validation.
+        management vs AKS networks in Gate 5 validation. If not specified, you will be
+        prompted to select from discovered networks.
 
     .PARAMETER AksNetwork
         Name of the logical network used for AKS Arc workload VMs. Used to distinguish
-        management vs AKS networks in Gate 5 validation.
+        management vs AKS networks in Gate 5 validation. If not specified, you will be
+        prompted to select from discovered networks.
 
     .EXAMPLE
         $ctx = Initialize-AksArcValidation
@@ -354,14 +361,50 @@ function Initialize-AksArcValidation {
     $lnets = if ($lnetRaw) { $lnetRaw | ConvertFrom-Json } else { @() }
     Write-Log "Logical Networks: $($lnets.Count) found" -Level Info
 
-    # Identify management vs AKS networks
+    # Identify management vs AKS networks — interactive selection when not specified
     if ($lnets.Count -gt 0 -and -not $ManagementNetwork -and -not $AksNetwork) {
-        Write-Log 'TIP: Use -ManagementNetwork and -AksNetwork to identify which logical network serves each role.' -Level Warning
+        $isInteractive = [Environment]::UserInteractive -and -not $env:TF_BUILD -and -not $env:GITHUB_ACTIONS -and -not $env:SYSTEM_TEAMPROJECT
+
         Write-Log 'Discovered logical networks:' -Level Info
-        foreach ($l in $lnets) {
+        for ($i = 0; $i -lt $lnets.Count; $i++) {
+            $l = $lnets[$i]
             $subnet = if ($l.properties.subnets) { $l.properties.subnets[0].properties.addressPrefix } else { 'N/A' }
             $vlan = if ($l.properties.subnets -and $l.properties.subnets[0].properties.vlan) { $l.properties.subnets[0].properties.vlan } else { 'none' }
-            Write-Log "  $($l.name) - Subnet: $subnet, VLAN: $vlan" -Level Info
+            $ipPools = if ($l.properties.subnets -and $l.properties.subnets[0].properties.ipPools) { $l.properties.subnets[0].properties.ipPools.Count } else { 0 }
+            Write-Log "  [$($i + 1)] $($l.name) - Subnet: $subnet, VLAN: $vlan, IP Pools: $ipPools" -Level Info
+        }
+
+        if ($isInteractive -and $lnets.Count -ge 2) {
+            Write-Host ''
+            Write-Host 'Network role assignment is required for Gate 5 validation.' -ForegroundColor Cyan
+            Write-Host 'Which logical network is used for management traffic?' -ForegroundColor Cyan
+            $mgmtInput = Read-Host "Enter number [1-$($lnets.Count)] or press Enter to skip"
+            if ($mgmtInput -match '^\d+$' -and [int]$mgmtInput -ge 1 -and [int]$mgmtInput -le $lnets.Count) {
+                $ManagementNetwork = $lnets[[int]$mgmtInput - 1].name
+                Write-Log "Management network: $ManagementNetwork" -Level Success
+            }
+
+            Write-Host 'Which logical network is used for AKS Arc workload VMs?' -ForegroundColor Cyan
+            $aksInput = Read-Host "Enter number [1-$($lnets.Count)] or press Enter to skip"
+            if ($aksInput -match '^\d+$' -and [int]$aksInput -ge 1 -and [int]$aksInput -le $lnets.Count) {
+                $AksNetwork = $lnets[[int]$aksInput - 1].name
+                Write-Log "AKS network: $AksNetwork" -Level Success
+            }
+
+            if (-not $ManagementNetwork -and -not $AksNetwork) {
+                Write-Log 'No network roles assigned. Gate 5 will run basic validation only.' -Level Warning
+            }
+        } elseif ($isInteractive -and $lnets.Count -eq 1) {
+            Write-Host ''
+            Write-Host "Only one logical network found: $($lnets[0].name)" -ForegroundColor Cyan
+            Write-Host 'Is this the AKS Arc workload network? (y/n)' -ForegroundColor Cyan
+            $singleInput = Read-Host '[y/n]'
+            if ($singleInput -match '^[yY]') {
+                $AksNetwork = $lnets[0].name
+                Write-Log "AKS network: $AksNetwork (single-subnet deployment)" -Level Success
+            }
+        } else {
+            Write-Log 'Non-interactive session detected. Use -ManagementNetwork and -AksNetwork for full Gate 5 validation.' -Level Warning
         }
     }
 
