@@ -5,6 +5,65 @@ All notable changes to the **AksArc.DeploymentReadiness** module will be documen
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-16
+
+### Added
+
+- **`New-AksArcReadinessReport`**: New function to generate self-contained HTML readiness reports. Supports single-site results, fleet results, and deployment plan IP capacity analysis. Styled with executive summary cards, gate result tables, remediation action items, and fleet cluster status grids.
+- **Fleet deep checks** in `Test-AksArcFleetReadiness`: Now checks extension health (failed extensions = deployment risk), logical network health, and AKS cluster count per Azure Local cluster.
+- **`-DeploymentPlan`** parameter on `Test-AksArcFleetReadiness` for fleet-wide IP capacity reporting.
+- **`-MinReadyPercent`** and **`-MaxWarningPercent`** configurable health gate thresholds on `Test-AksArcFleetReadiness`. Default: 100% ready, 10% max warnings.
+- **`-ThrottleLimit`** parameter on `Test-AksArcFleetReadiness` for parallel data collection via `Start-Job` (default: 4). Reduces API call time for fleets of 20+ clusters.
+- **Three-state fleet status**: Clusters now report `Ready`, `Warning`, or `NotReady` (was binary Ready/NotReady). Warnings track extension failures and LNET issues.
+- **Fleet result properties**: `ExtensionTotal`, `ExtensionFailed`, `FailedExtensions`, `LogicalNetworks`, `LogicalNetworkOk`, `AksClusterCount`, `Warnings`.
+
+### Changed
+
+- **`Test-AksArcFleetReadiness`** rewritten with parallel data collection architecture. Per-cluster queries (ARB, Custom Location, Extensions, LNETs, AKS clusters) run in parallel via `Start-Job` with configurable throttle.
+- Fleet summary now shows Ready/Warning/NotReady breakdown and health gate pass/fail.
+- Module now exports **10 functions** (was 9).
+
+## [0.4.0] - 2026-04-16
+
+### Added
+
+- **Gate 7 — Active Cross-Subnet Port Testing**: Real TCP connectivity tests on cross-VLAN ports (22, 443, 6443, 9440, 55000, 65000) when target IPs are provided. Tests direction-aware: management→AKS subnet ports and AKS subnet→cluster ports. Arc Gateway port 40343 conditionally tested.
+- **Gate 8 — RBAC Permission Validation**: Validates that the logged-in identity has sufficient Azure RBAC permissions for AKS Arc deployment. Checks for Owner/Contributor/AKS Arc Contributor roles, or drills into custom role permissions for specific actions like `Microsoft.Kubernetes/connectedClusters/write`.
+- **`-ManagementIPs`**, **`-AksSubnetTestIP`**, **`-ClusterIP`** parameters on `Initialize-AksArcValidation` for active port testing targets.
+- **Direction metadata** (`testDirection`) on cross-subnet port entries in `endpoints.json` — `toAks` for management→AKS subnet ports, `toCluster` for AKS subnet→cluster ports.
+- **Conditional port flag** on port 40343 (Arc Gateway) — skipped unless explicitly enabled.
+
+### Changed
+
+- **`Invoke-AzRestCall`** enhanced with structured error handling: captures stderr, logs error messages, supports `-ThrowOnError` switch and `-ApiVersion` override. Previously swallowed all errors silently.
+- Assessment now runs **8 gates** (was 6): Cluster Health, ARB, Custom Location, Network Connectivity, Logical Networks, Cross-Subnet Ports (info), Active Port Testing, RBAC.
+
+## [0.3.0] - 2026-04-16
+
+### Added
+
+- **`New-AksArcDeploymentPlan`**: New function to create a deployment plan with IP capacity math. Calculates total IPs needed for node VMs, rolling upgrades, control plane (KubeVIP), load balancer (MetalLB), and autoscale headroom. Supports interactive prompts with CI/CD fallback to defaults.
+- **`-DeploymentPlan` parameter** on `Test-AksArcDeploymentReadiness`: When provided, Gate 5 validates that the AKS logical network IP pool has sufficient capacity for the planned deployment.
+- **On-node detection** in `Initialize-AksArcValidation`: Detects whether the module is running on an Azure Local node (via `Get-ClusterNode`) and warns when running remotely that network connectivity tests validate from the wrong vantage point.
+- **`HostType` property** on the context object returned by `Initialize-AksArcValidation` (`AzureLocalNode`, `RemoteHost`, or `Unknown`).
+
+### Changed
+
+- **Gate 5 (Logical Networks)**: Rewritten from existence checks to deep validation:
+  - IP pool capacity validation: counts available IPs across pools, compares against deployment plan requirements, reports surplus or deficit
+  - IP allocation method check: fails if DHCP detected (AKS Arc requires static)
+  - DNS server validation: tests each configured DNS server for ability to resolve Azure endpoints (`mcr.microsoft.com`, `management.azure.com`)
+  - Gateway validation: warns if no default gateway is configured
+  - Load balancer IP guidance: warns that MetalLB IPs must be in same subnet but outside the IP pool range
+  - Missing IP pool is now a **failure** (was warning) for AKS-designated networks
+
+### Tests
+
+- Updated module structure tests for 9 exported functions (was 8)
+- Added 11 new Pester tests for `New-AksArcDeploymentPlan`: parameter existence, single-cluster IP math, multi-cluster IP math, autoscale headroom, edge cases
+- Added parameter test for `Test-AksArcDeploymentReadiness -DeploymentPlan`
+- Total tests: 28 → 40
+
 ## [0.2.0] - 2026-04-15
 
 ### Changed

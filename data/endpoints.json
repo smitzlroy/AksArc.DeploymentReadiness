@@ -1142,12 +1142,12 @@
     }
   ],
   "crossSubnetPorts": [
-    { "port": 22, "protocol": "TCP", "direction": "management <-> AKS subnet", "purpose": "SSH node access" },
-    { "port": 443, "protocol": "TCP", "direction": "management <-> AKS subnet", "purpose": "HTTPS / API communication" },
-    { "port": 6443, "protocol": "TCP", "direction": "management <-> AKS subnet", "purpose": "Kubernetes API server" },
-    { "port": 9440, "protocol": "TCP", "direction": "management <-> AKS subnet", "purpose": "MOC cloud agent" },
-    { "port": 40343, "protocol": "TCP", "direction": "management <-> AKS subnet", "purpose": "Arc Gateway (when enabled)" },
-    { "port": 55000, "protocol": "TCP", "direction": "management <-> AKS subnet", "purpose": "gRPC / Cloud Agent" },
-    { "port": 65000, "protocol": "TCP", "direction": "management <-> AKS subnet", "purpose": "Cloud Agent Authentication" }
+    { "port": 22, "protocol": "TCP", "direction": "management <-> AKS subnet", "testDirection": "toAks", "purpose": "SSH node access" },
+    { "port": 443, "protocol": "TCP", "direction": "management <-> AKS subnet", "testDirection": "toAks", "purpose": "HTTPS / API communication" },
+    { "port": 6443, "protocol": "TCP", "direction": "management <-> AKS subnet", "testDirection": "toAks", "purpose": "Kubernetes API server" },
+    { "port": 9440, "protocol": "TCP", "direction": "management <-> AKS subnet", "testDirection": "toAks", "purpose": "MOC cloud agent" },
+    { "port": 40343, "protocol": "TCP", "direction": "management <-> AKS subnet", "testDirection": "toCluster", "purpose": "Arc Gateway (when enabled)", "conditional": true },
+    { "port": 55000, "protocol": "TCP", "direction": "management <-> AKS subnet", "testDirection": "toCluster", "purpose": "gRPC / Cloud Agent" },
+    { "port": 65000, "protocol": "TCP", "direction": "management <-> AKS subnet", "testDirection": "toCluster", "purpose": "Cloud Agent Authentication" }
   ]
 }

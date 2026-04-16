@@ -1,8 +1,8 @@
 # AksArc.DeploymentReadiness
 
 <p align="center">
-  <strong>Pre-deployment readiness validation for AKS Arc on Azure Local</strong><br/>
-  <em>v0.2.0 — 86 endpoints &bull; 7 cross-subnet ports &bull; 15 components</em>
+  <strong>Stop discovering AKS Arc deployment problems 45 minutes into the deploy</strong><br/>
+  <em>Pre-flight validation: 8 readiness gates &bull; 86 firewall endpoints &bull; IP capacity math &bull; cross-VLAN port tests &bull; RBAC checks &bull; fleet scale</em>
 </p>
 
 <p align="center">
@@ -22,16 +22,45 @@
 
 ---
 
-## What is this?
+## Why does this exist?
 
-A PowerShell module that answers: **"Is my Azure Local cluster ready for AKS Arc?"**
+Deploying AKS Arc on Azure Local fails for preventable reasons. The top causes:
 
-It validates network connectivity, endpoint reachability, cluster health, Arc Resource Bridge status, and logical network configuration — then gives you a clear pass/fail report you can hand to your team or pipe into CI/CD.
+1. **Not enough IPs** — You need 1 IP per node VM + 1 rolling upgrade IP + 1 control plane IP *per cluster*, plus load balancer IPs in the same subnet but outside the pool. Nobody does this math correctly the first time.
+2. **Firewall blocking endpoints** — AKS Arc needs 86 endpoints open across 15 Azure components. Your security team will ask "which ones?" and the answer is scattered across 4 different Microsoft docs pages.
+3. **DNS doesn't work on the logical network** — The LNET has DNS servers configured in Azure, but those servers can't actually resolve `mcr.microsoft.com` from the AKS subnet.
+4. **Cross-VLAN ports closed** — Ports 22, 6443, 55000, 65000 need to be open between management and AKS subnets. Nobody tests these until deployment fails.
+5. **Wrong RBAC role** — You discover you're missing `Microsoft.HybridContainerService/provisionedClusterInstances/write` midway through a 45-minute deployment.
+6. **DHCP instead of static** — AKS Arc requires static IP allocation. Your LNET was created with the default.
 
-It ships with a **consolidated firewall endpoint reference** (86 endpoints + 7 cross-subnet ports) sourced from [Azure/AzureStack-Tools](https://github.com/Azure/AzureStack-Tools/blob/master/HCI/EastUSendpoints/eastus-hci-endpoints.md) that you can export as CSV, JSON, or Markdown for your network security team.
+This module catches all of these **before** you start deploying.
+
+---
+
+## What does it do?
+
+**8 readiness gates** that validate everything AKS Arc needs:
+
+| Gate | What it catches |
+|:---|:---|
+| 1 — Cluster Health | Azure Local cluster offline or failed provisioning |
+| 2 — Arc Resource Bridge | ARB not running (prerequisite for all AKS Arc operations) |
+| 3 — Custom Location | Missing custom location (required to place AKS clusters) |
+| 4 — Network Connectivity | 86 endpoints unreachable from the node (firewall/proxy issues) |
+| 5 — Logical Networks | Insufficient IPs, DHCP instead of static, broken DNS servers, missing gateway, no VLAN separation |
+| 6 — Cross-Subnet Ports | Documents the 7 ports that must be open between VLANs |
+| 7 — Active Port Testing | Real TCP tests on cross-VLAN ports when you provide target IPs |
+| 8 — RBAC Permissions | Missing deployment permissions on the logged-in identity |
+
+**Plus:**
+- **IP capacity calculator** — Tell it "2 clusters × 5 workers with autoscale to 10" and it calculates exactly how many IPs you need from the pool and in the subnet
+- **Firewall rule export** — Gives your security team a ready-to-submit CSV/Markdown with all 86 endpoints + 7 cross-subnet ports
+- **Fleet assessment** — Validate 50+ clusters in parallel via Azure Resource Graph with configurable health thresholds
+- **HTML reports** — Self-contained readiness report you can attach to a change request or email to your team
+- **CI/CD ready** — JUnit XML export for Azure DevOps and GitHub Actions pipelines
 
 > [!NOTE]
-> This is a **community tool** distributed under the [MIT License](LICENSE). Not a Microsoft-supported product.
+> **Community tool** — MIT License. Not a Microsoft-supported product. Designed by people who deploy AKS Arc and got tired of discovering problems 45 minutes into a deployment.
 
 ---
 
@@ -63,34 +92,64 @@ Import-Module ./AksArc.DeploymentReadiness/AksArc.DeploymentReadiness.psd1
 
 ## Quick Start
 
-### Single-site readiness check (run from an Azure Local node)
+### "Will my deployment work?" (run from an Azure Local node)
 
 ```powershell
 Import-Module AksArc.DeploymentReadiness
 
-# Auto-discover cluster, ARB, custom location, and logical networks
-# Use -ManagementNetwork / -AksNetwork to tag which LNET is which
+# 1. Auto-discover your cluster infrastructure
 $ctx = Initialize-AksArcValidation -ManagementNetwork 'mgmt-lnet' -AksNetwork 'aks-lnet'
 
-# Run all 6 readiness gates — export JUnit XML for your pipeline
-Test-AksArcDeploymentReadiness -Context $ctx -ExportPath readiness-results.xml
+# 2. Tell it what you plan to deploy
+$plan = New-AksArcDeploymentPlan -PlannedClusters 2 -WorkerNodes 5 -LoadBalancerIPs 3
+
+# 3. Get a pass/fail answer with specific fix guidance for every failure
+Test-AksArcDeploymentReadiness -Context $ctx -DeploymentPlan $plan -ExportPath readiness-results.xml
 ```
 
-### Get the firewall rules for your security team
+### "I need the firewall rules for a change request"
 
 ```powershell
-# Markdown table (great for wiki/email)
-Export-AksArcFirewallRules -Path firewall-request.md -Region eastus -IncludeCrossSubnetPorts
-
-# CSV for Excel / ServiceNow
-Export-AksArcFirewallRules -Path firewall-request.csv -Region eastus
+# One command — ready to paste into ServiceNow or email to your security team
+Export-AksArcFirewallRules -Path firewall-request.csv -Region eastus -IncludeCrossSubnetPorts
 ```
 
-### Fleet-wide assessment (run from any workstation)
+### "I want the full picture" (all 8 gates including port tests and RBAC)
+
+```powershell
+$ctx = Initialize-AksArcValidation -ManagementNetwork 'mgmt-lnet' -AksNetwork 'aks-lnet' `
+    -AksSubnetTestIP '10.0.2.10' -ClusterIP '10.0.1.5'
+
+$plan = New-AksArcDeploymentPlan -PlannedClusters 2 -WorkerNodes 5 -LoadBalancerIPs 3
+$results = Test-AksArcDeploymentReadiness -Context $ctx -DeploymentPlan $plan -PassThru
+
+# Generate an HTML report to attach to your change request
+New-AksArcReadinessReport -Results $results -DeploymentPlan $plan -Context $ctx -OutputPath readiness.html
+```
+
+### "How many IPs do I actually need?"
+
+```powershell
+# Just calculate — no cluster connection required
+$plan = New-AksArcDeploymentPlan -PlannedClusters 3 -WorkerNodes 8 `
+    -EnableAutoScale -MaxAutoScaleNodes 15 -LoadBalancerIPs 10
+# Output: "Need 47 IPs in pool + 10 LB IPs = 57 IPs in subnet"
+```
+
+### "Are all 50 of my sites ready?" (run from any workstation)
 
 ```powershell
 Connect-AksArcServicePrincipal -UseManagedIdentity
-Test-AksArcFleetReadiness -ScopeByTag -TagName 'ReadinessRing' -TagValue 'Wave1' -ExportPath fleet.xml
+Test-AksArcFleetReadiness -ScopeByTag -TagName 'ReadinessRing' -TagValue 'Wave1' `
+    -MinReadyPercent 90 -ExportPath fleet.xml
+```
+
+### Quick structural check (no deployment plan)
+
+```powershell
+# Still works without a plan — validates structure only, no IP capacity math
+$ctx = Initialize-AksArcValidation -ManagementNetwork 'mgmt-lnet' -AksNetwork 'aks-lnet'
+Test-AksArcDeploymentReadiness -Context $ctx -ExportPath readiness-results.xml
 ```
 
 ---
@@ -110,6 +169,9 @@ Initialize-AksArcValidation
     [-ClusterName <string>]
     [-ManagementNetwork <string>]
     [-AksNetwork <string>]
+    [-ManagementIPs <string[]>]
+    [-AksSubnetTestIP <string>]
+    [-ClusterIP <string>]
 ```
 
 | Parameter | Description |
@@ -119,14 +181,77 @@ Initialize-AksArcValidation
 | `-ClusterName` | Cluster name. Auto-detected via `az stack-hci cluster list` if omitted. |
 | `-ManagementNetwork` | Name of the logical network used for management traffic. If omitted, discovered LNETs are listed so you can identify them. |
 | `-AksNetwork` | Name of the logical network used for AKS workloads. If omitted, discovered LNETs are listed so you can identify them. |
+| `-ManagementIPs` | IP addresses on the management subnet (e.g., ARB IP, cluster IP) for active cross-VLAN port testing. |
+| `-AksSubnetTestIP` | An IP on the AKS subnet to test connectivity to (for Gate 7 active port tests on ports 22/443/6443/9440). |
+| `-ClusterIP` | Azure Local cluster IP for testing ports 55000/65000 (gRPC/Auth from AKS subnet to cluster). |
 
-**Output:** A context hashtable containing cluster metadata, ARB status, custom location, and LNET details — passed to `Test-AksArcDeploymentReadiness` via `-Context`.
+**Output:** A context object containing cluster metadata, ARB status, custom location, LNET details, and `HostType` — passed to `Test-AksArcDeploymentReadiness` via `-Context`.
+
+> [!NOTE]
+> **On-node detection (v0.3.0):** The module detects whether it's running on an Azure Local node or a remote workstation. If running remotely, a warning is emitted because network connectivity tests (Gate 4) validate from the *current machine*, not from the Azure Local nodes where firewall rules actually matter. For accurate firewall validation, run this module from an Azure Local node.
+
+---
+
+#### `New-AksArcDeploymentPlan`
+
+Creates a deployment plan that calculates IP address requirements for your planned AKS Arc deployment. The plan object feeds into `Test-AksArcDeploymentReadiness` to validate that your logical network IP pools have enough capacity.
+
+```powershell
+New-AksArcDeploymentPlan
+    [-PlannedClusters <int>]       # Default: 1
+    [-ControlPlaneNodes <int>]     # 1 or 3 (default: 3)
+    [-WorkerNodes <int>]           # Default: 3
+    [-LoadBalancerIPs <int>]       # Default: 0
+    [-EnableAutoScale]             # Add headroom for autoscaler
+    [-MaxAutoScaleNodes <int>]     # Max workers when autoscaling
+    [-AksNetworkName <string>]     # LNET name for AKS traffic
+    [-ManagementNetworkName <string>] # LNET name for management
+    [-Context <object>]            # From Initialize-AksArcValidation
+```
+
+| Parameter | Description |
+|:---|:---|
+| `-PlannedClusters` | Number of AKS Arc clusters to deploy. Default: 1. |
+| `-ControlPlaneNodes` | Control plane nodes per cluster (1 or 3). Default: 3. |
+| `-WorkerNodes` | Worker nodes per cluster. Default: 3. |
+| `-LoadBalancerIPs` | IPs for MetalLB / load balancer services. These must be in the same subnet but *outside* the IP pool. Default: 0. |
+| `-EnableAutoScale` | Include headroom IPs for node autoscaler. Requires `-MaxAutoScaleNodes`. |
+| `-MaxAutoScaleNodes` | Maximum worker nodes per cluster when autoscaling. |
+| `-AksNetworkName` | Logical network name for AKS workloads. |
+| `-ManagementNetworkName` | Logical network name for management traffic. |
+| `-Context` | Context from `Initialize-AksArcValidation`. |
+
+**IP Calculation Formula:**
+
+```
+Total IP pool required = (ControlPlaneNodes + WorkerNodes) × PlannedClusters
+                       + PlannedClusters  (1 rolling upgrade IP per cluster)
+                       + PlannedClusters  (1 control plane / KubeVIP per cluster)
+                       + AutoscaleHeadroom (if enabled)
+
+Load balancer IPs      = separate, same subnet but OUTSIDE the IP pool
+Total IPs in subnet    = IP pool required + LoadBalancerIPs
+```
+
+**Example:**
+
+```powershell
+# 2 clusters × (3 CP + 5 workers) + 2 upgrade + 2 CP + 3 LB = 23 IPs in subnet
+$plan = New-AksArcDeploymentPlan -PlannedClusters 2 -WorkerNodes 5 -LoadBalancerIPs 3
+
+# With autoscale: adds headroom for max 10 workers per cluster
+$plan = New-AksArcDeploymentPlan -PlannedClusters 1 -WorkerNodes 3 \
+    -EnableAutoScale -MaxAutoScaleNodes 10 -LoadBalancerIPs 5
+```
+
+> [!TIP]
+> **Interactive mode:** If you omit parameters when running interactively, the module prompts you with sensible defaults. In CI/CD pipelines (non-interactive), defaults are used silently.
 
 ---
 
 #### `Test-AksArcDeploymentReadiness`
 
-Runs **6 readiness gates** and reports pass/fail with remediation guidance:
+Runs **8 readiness gates** and reports pass/fail with remediation guidance:
 
 | Gate | What it checks |
 |:---|:---|
@@ -134,12 +259,15 @@ Runs **6 readiness gates** and reports pass/fail with remediation guidance:
 | 2 — Arc Resource Bridge | ARB provisioning state and running status |
 | 3 — Custom Location | Custom location exists and is provisioned |
 | 4 — Network Connectivity | TCP/DNS reachability to all 86 required endpoints |
-| 5 — Logical Networks | LNET provisioning state, subnet, VLAN, IP pool config; management vs. AKS classification |
-| 6 — Cross-Subnet Ports | Port requirements between management and AKS subnets |
+| 5 — Logical Networks | **Deep validation**: IP pool capacity vs. deployment plan, DNS server resolution, gateway config, static IP enforcement, VLAN separation |
+| 6 — Cross-Subnet Ports | Port requirements between management and AKS subnets (informational) |
+| 7 — Active Port Testing | **Real TCP tests** on cross-VLAN ports when target IPs are provided via `-AksSubnetTestIP` / `-ClusterIP` |
+| 8 — RBAC Permissions | Validates the logged-in identity has sufficient Azure RBAC roles for AKS Arc deployment |
 
 ```powershell
 Test-AksArcDeploymentReadiness
-    -Context <hashtable>
+    -Context <object>
+    [-DeploymentPlan <object>]    # From New-AksArcDeploymentPlan
     [-Region <string>]
     [-SkipNetworkTests]
     [-PassThru]
@@ -149,10 +277,46 @@ Test-AksArcDeploymentReadiness
 | Parameter | Description |
 |:---|:---|
 | `-Context` | **Required.** Output from `Initialize-AksArcValidation`. |
+| `-DeploymentPlan` | Output from `New-AksArcDeploymentPlan`. Enables IP capacity validation in Gate 5. |
 | `-Region` | Azure region for resolving region-specific endpoints (e.g., `eastus`). Strongly recommended. |
 | `-SkipNetworkTests` | Skip Gate 4 (network connectivity) for faster structural-only validation. |
 | `-PassThru` | Return result objects to the pipeline. |
 | `-ExportPath` | Export results to `.csv`, `.json`, or `.xml` (JUnit format). |
+
+**Gate 5 Deep Validation (v0.3.0):**
+
+When a `-DeploymentPlan` is provided, Gate 5 performs these additional checks on the AKS logical network:
+
+| Check | Behavior |
+|:---|:---|
+| IP pool exists | **Fails** if no IP pool is configured on the AKS logical network |
+| IP pool capacity | **Fails** if available IPs < required IPs from deployment plan; **warns** if < 20% headroom |
+| IP allocation method | **Fails** if not `Static` (DHCP is not supported for AKS Arc) |
+| DNS servers | **Fails** if no DNS servers configured; tests each DNS server can resolve `mcr.microsoft.com` and `management.azure.com` |
+| Gateway | **Warns** if no default gateway is configured |
+| Network separation | **Warns** if management and AKS use the same logical network (best practice is separate VLANs) |
+| Load balancer guidance | Informational note that MetalLB IPs must be in same subnet but outside the IP pool range |
+
+**Gate 7 Active Port Testing (v0.4.0):**
+
+When `-AksSubnetTestIP` and/or `-ClusterIP` are provided to `Initialize-AksArcValidation`, Gate 7 performs real TCP connectivity tests:
+
+| Port | Direction | Tested when |
+|:---|:---|:---|
+| 22, 443, 6443, 9440 | Current host → AKS subnet IP | `-AksSubnetTestIP` provided |
+| 55000, 65000 | Current host → Cluster IP | `-ClusterIP` provided |
+| 40343 | Current host → Cluster IP | Skipped (conditional — Arc Gateway only) |
+
+If no target IPs are provided, Gate 7 is gracefully skipped with guidance on which parameters to add.
+
+**Gate 8 RBAC Validation (v0.4.0):**
+
+Gate 8 checks whether the current identity (user or service principal) has the required RBAC permissions for AKS Arc deployment at the resource group scope. It recognizes these built-in roles as sufficient:
+
+- **Owner** / **Contributor** (full access)
+- **Azure Kubernetes Service Arc Contributor** (purpose-built role)
+
+For custom roles, it drills into the specific actions and checks for: `Microsoft.Kubernetes/connectedClusters/write`, `Microsoft.ExtendedLocation/customLocations/read`, `Microsoft.AzureStackHCI/logicalNetworks/read`, `Microsoft.HybridContainerService/provisionedClusterInstances/write`.
 
 ---
 
@@ -224,7 +388,7 @@ Export-AksArcFirewallRules
 
 #### `Test-AksArcFleetReadiness`
 
-Batch readiness assessment across multiple clusters via Azure Resource Graph.
+Batch readiness assessment across multiple clusters via Azure Resource Graph. Checks cluster connectivity, ARB health, custom location, extension health, logical network health, and AKS cluster count. Supports parallel data collection and configurable health gate thresholds.
 
 ```powershell
 Test-AksArcFleetReadiness
@@ -234,10 +398,21 @@ Test-AksArcFleetReadiness
     [-TagName <string>]            # Default: 'ReadinessRing'
     [-TagValue <string>]
     [-SubscriptionId <string>]
+    [-DeploymentPlan <object>]     # From New-AksArcDeploymentPlan
+    [-MinReadyPercent <int>]       # Default: 100 (0-100)
+    [-MaxWarningPercent <int>]     # Default: 10 (0-100)
+    [-ThrottleLimit <int>]         # Default: 4 (1-20)
     [-BatchSize <int>]             # Default: 50
     [-PassThru]
     [-ExportPath <string>]
 ```
+
+| Parameter | Description |
+|:---|:---|
+| `-DeploymentPlan` | Deployment plan for fleet-wide IP capacity reporting. |
+| `-MinReadyPercent` | Minimum % of clusters that must be Ready+Warning for fleet gate to pass. Default: 100. |
+| `-MaxWarningPercent` | Maximum % of clusters with warnings before fleet gate fails. Default: 10. |
+| `-ThrottleLimit` | Max parallel `Start-Job` workers for data collection. Default: 4. Increase for large fleets. |
 
 ---
 
@@ -253,6 +428,32 @@ Get-AksArcFleetProgress
     [-SubscriptionId <string>]
     [-Detailed]
 ```
+
+---
+
+### Tier 4 — Reporting
+
+#### `New-AksArcReadinessReport`
+
+Generates a self-contained HTML readiness report from single-site results, fleet results, or deployment plan data.
+
+```powershell
+New-AksArcReadinessReport
+    [-Results <object[]>]          # From Test-AksArcDeploymentReadiness -PassThru
+    [-FleetResults <object[]>]     # From Test-AksArcFleetReadiness -PassThru
+    [-DeploymentPlan <object>]     # From New-AksArcDeploymentPlan
+    [-Context <object>]            # From Initialize-AksArcValidation
+    [-Title <string>]              # Default: 'AKS Arc Deployment Readiness Report'
+    -OutputPath <string>           # Required. Path for .html output
+    [-PassThru]                    # Return HTML string
+```
+
+**Report sections:**
+- Executive summary cards (Passed / Failed / Warning / Skipped)
+- IP capacity analysis table (when `-DeploymentPlan` provided)
+- Per-gate results with status badges
+- Remediation action items (failed checks with fix guidance)
+- Fleet cluster status grid (when `-FleetResults` provided)
 
 ---
 
@@ -293,21 +494,39 @@ $failed = Test-AksArcNetworkConnectivity -Region eastus -PassThru |
 $failed | Format-Table Url, Port, Detail
 ```
 
-### Full readiness with export
+### Full readiness with deployment plan
 
 ```powershell
 $ctx = Initialize-AksArcValidation -ClusterName 'mycluster' `
     -ManagementNetwork 'mgmt-lnet' -AksNetwork 'aks-lnet'
 
-# JUnit XML for pipeline test reporters
-Test-AksArcDeploymentReadiness -Context $ctx -Region eastus -ExportPath results.xml
+# Plan: 3 AKS clusters, 5 workers each, MetalLB with 5 IPs
+$plan = New-AksArcDeploymentPlan -PlannedClusters 3 -WorkerNodes 5 -LoadBalancerIPs 5
+
+# Run full validation including IP capacity check
+Test-AksArcDeploymentReadiness -Context $ctx -DeploymentPlan $plan -Region eastus -ExportPath results.xml
 
 # JSON for programmatic consumption — filter to failures only
-Test-AksArcDeploymentReadiness -Context $ctx -ExportPath results.json -PassThru |
+Test-AksArcDeploymentReadiness -Context $ctx -DeploymentPlan $plan -ExportPath results.json -PassThru |
     Where-Object Status -eq 'Failed'
 
 # WhatIf — preview what gates would run
 Test-AksArcDeploymentReadiness -Context $ctx -WhatIf
+```
+
+### IP capacity planning scenarios
+
+```powershell
+# Small dev/test: 1 cluster, 1 CP node, 2 workers — needs 4 IPs from pool
+New-AksArcDeploymentPlan -PlannedClusters 1 -ControlPlaneNodes 1 -WorkerNodes 2
+
+# Production: 2 clusters, 3 CP nodes, 8 workers, autoscale to 15, 10 LB IPs
+New-AksArcDeploymentPlan -PlannedClusters 2 -WorkerNodes 8 `
+    -EnableAutoScale -MaxAutoScaleNodes 15 -LoadBalancerIPs 10
+
+# Just calculate — no validation needed
+$plan = New-AksArcDeploymentPlan -PlannedClusters 5 -WorkerNodes 10
+Write-Host "Need $($plan.TotalRequiredIPs) IPs in pool + $($plan.LoadBalancerIPs) LB IPs"
 ```
 
 ### Fleet operations
@@ -316,11 +535,26 @@ Test-AksArcDeploymentReadiness -Context $ctx -WhatIf
 # Assess specific clusters
 Test-AksArcFleetReadiness -ClusterNames @('site-east-01', 'site-west-02') -ExportPath fleet.csv
 
-# Assess by tag
-Test-AksArcFleetReadiness -ScopeByTag -TagName 'Environment' -TagValue 'Production'
+# Assess by tag with health gate threshold (80% must be ready)
+Test-AksArcFleetReadiness -ScopeByTag -TagName 'Environment' -TagValue 'Production' `
+    -MinReadyPercent 80 -MaxWarningPercent 15
 
 # Fleet dashboard
 Get-AksArcFleetProgress -Detailed
+```
+
+### HTML reports
+
+```powershell
+# Single-site report
+$ctx = Initialize-AksArcValidation -ManagementNetwork 'mgmt' -AksNetwork 'aks'
+$plan = New-AksArcDeploymentPlan -PlannedClusters 2 -WorkerNodes 5 -LoadBalancerIPs 3
+$results = Test-AksArcDeploymentReadiness -Context $ctx -DeploymentPlan $plan -PassThru
+New-AksArcReadinessReport -Results $results -DeploymentPlan $plan -Context $ctx -OutputPath readiness.html
+
+# Fleet report
+$fleet = Test-AksArcFleetReadiness -ScopeByTag -TagValue 'Production' -PassThru
+New-AksArcReadinessReport -FleetResults $fleet -OutputPath fleet-report.html
 ```
 
 ### Endpoint data freshness
@@ -448,7 +682,7 @@ See full examples: [GitHub Actions](Automation-Pipeline-Examples/github-actions-
 On machines with OneDrive folder redirection, PowerShell 5.1 may not include the OneDrive-redirected Documents path in `$env:PSModulePath`. Use **PowerShell 7** (`pwsh`) or import by full path:
 
 ```powershell
-Import-Module "$env:USERPROFILE\OneDrive - Microsoft\Documents\PowerShell\Modules\AksArc.DeploymentReadiness\0.2.0\AksArc.DeploymentReadiness.psd1"
+Import-Module "$env:USERPROFILE\OneDrive - Microsoft\Documents\PowerShell\Modules\AksArc.DeploymentReadiness\0.5.0\AksArc.DeploymentReadiness.psd1"
 ```
 
 ### Region-specific endpoints skipped
@@ -484,12 +718,12 @@ Test-NetConnection yourid.gw.arc.azure.com -Port 443
 
 ```
 AksArc.DeploymentReadiness/
-├── AksArc.DeploymentReadiness.psd1          # Module manifest (v0.2.0)
+├── AksArc.DeploymentReadiness.psd1          # Module manifest (v0.5.0)
 ├── AksArc.DeploymentReadiness.psm1          # All functions (single-file module)
 ├── data/
 │   └── endpoints.json                       # 86 endpoints + 7 cross-subnet ports
 ├── Tests/
-│   └── AksArc.DeploymentReadiness.Tests.ps1 # Pester test suite (28 tests)
+│   └── AksArc.DeploymentReadiness.Tests.ps1 # Pester test suite (69 tests)
 ├── Automation-Pipeline-Examples/
 │   ├── github-actions-fleet-readiness.yml   # GitHub Actions workflow
 │   └── azure-devops-fleet-readiness.yml     # Azure DevOps pipeline
@@ -524,4 +758,6 @@ pwsh -c "Import-Module ./AksArc.DeploymentReadiness.psd1; Get-Command -Module Ak
 ## Acknowledgments
 
 - Module patterns inspired by [AzStackHci.ManageUpdates](https://github.com/NeilBird/Azure-Local/tree/main/AzStackHci.ManageUpdates) by Neil Bird
+- Fleet-scale patterns influenced by [AzureLocal-LENS-Workbook](https://github.com/Azure/AzureLocal-LENS-Workbook) (Azure Resource Graph queries)
 - Endpoint data sourced from [Azure/AzureStack-Tools](https://github.com/Azure/AzureStack-Tools/blob/master/HCI/EastUSendpoints/eastus-hci-endpoints.md)
+- IP address planning based on [AKS Arc IP address planning requirements](https://learn.microsoft.com/en-us/azure/aks/aksarc/aks-hci-ip-address-planning)
