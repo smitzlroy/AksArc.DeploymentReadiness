@@ -98,6 +98,72 @@ function Test-DnsName {
     return $result
 }
 
+function ConvertFrom-AzJson {
+    <# Safely parse JSON text, stripping non-JSON lines (warnings, progress text) #>
+    param([object]$RawText)
+    if (-not $RawText) { return $null }
+    $text = if ($RawText -is [array]) { $RawText -join "`n" } else { [string]$RawText }
+    $text = $text.Trim()
+    if (-not $text) { return $null }
+    # Find the first [ or { to strip leading non-JSON text
+    $jsonStart = -1
+    for ($i = 0; $i -lt $text.Length; $i++) {
+        if ($text[$i] -eq '[' -or $text[$i] -eq '{') { $jsonStart = $i; break }
+    }
+    if ($jsonStart -lt 0) { return $null }
+    $jsonText = $text.Substring($jsonStart)
+    try { return ($jsonText | ConvertFrom-Json) } catch { return $null }
+}
+
+function Invoke-AzCliJson {
+    <#
+    .SYNOPSIS
+        Run az CLI and return parsed JSON, using System.Diagnostics.Process to bypass
+        PS 5.1 native command stderr/stdout redirection bugs.
+    #>
+    param([string]$Arguments)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'cmd.exe'
+    $psi.Arguments = "/c az $Arguments -o json 2>nul"
+    $psi.RedirectStandardOutput = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { return $null }
+        return (ConvertFrom-AzJson $stdout)
+    } catch {
+        Write-Log "  Invoke-AzCliJson failed: $($_.Exception.Message)" -Level Warning
+        return $null
+    }
+}
+
+function Invoke-AzCliRaw {
+    <#
+    .SYNOPSIS
+        Run az CLI and return raw stdout text (no JSON parsing).
+        Uses System.Diagnostics.Process to bypass PS 5.1 redirection bugs.
+    #>
+    param([string]$Arguments)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'cmd.exe'
+    $psi.Arguments = "/c az $Arguments 2>nul"
+    $psi.RedirectStandardOutput = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { return $null }
+        return $stdout
+    } catch {
+        return $null
+    }
+}
+
 function Invoke-AzRestCall {
     param(
         [string]$Uri,
@@ -106,23 +172,16 @@ function Invoke-AzRestCall {
         [switch]$ThrowOnError
     )
     $fullUri = "https://management.azure.com${Uri}?api-version=$ApiVersion"
-    $errOutput = $null
-    $raw = az rest --method $Method --uri $fullUri 2>&1 | ForEach-Object {
-        if ($_ -is [System.Management.Automation.ErrorRecord]) {
-            $errOutput = $_.ToString()
-        } else {
-            $_
-        }
-    }
-    if ($LASTEXITCODE -ne 0 -or -not $raw) {
-        $errMsg = if ($errOutput) { $errOutput } else { "HTTP $Method $Uri returned no data (exit code $LASTEXITCODE)" }
+    $result = Invoke-AzCliJson "rest --method $Method --uri `"$fullUri`""
+    if (-not $result) {
+        $errMsg = "HTTP $Method $Uri returned no data"
         Write-Log "  REST call failed: $errMsg" -Level Warning
         if ($ThrowOnError) {
             throw "Azure REST call failed: $errMsg"
         }
         return $null
     }
-    return ($raw | ConvertFrom-Json)
+    return $result
 }
 
 function New-ValidationResult {
@@ -251,48 +310,60 @@ function Initialize-AksArcValidation {
     Write-Log 'AKS Arc Deployment Readiness - Initialize' -Level Header
     Write-Log '========================================' -Level Header
 
-    # Check Azure CLI
+    # Step 1: Check Azure CLI
+    Write-Log '[Step 1/6] Checking Azure CLI...' -Level Info
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
         throw 'Azure CLI (az) is not installed or not in PATH. Install from https://aka.ms/installazurecli'
     }
 
-    # Check login
-    $accountRaw = az account show -o json 2>$null
-    if (-not $accountRaw) {
-        Write-Log 'Not logged in. Starting device-code login...' -Level Warning
-        az login --use-device-code 2>$null
-        $accountRaw = az account show -o json 2>$null
-        if (-not $accountRaw) {
-            throw 'Azure CLI login failed. Run "az login --use-device-code" manually.'
+    # Step 2: Check login
+    Write-Log '[Step 2/6] Checking Azure login...' -Level Info
+    $account = Invoke-AzCliJson 'account show'
+    if (-not $account) {
+        Write-Log 'Not logged in. On headless/server nodes, use device-code authentication.' -Level Warning
+        Write-Host ''
+        Write-Host 'Starting device-code login. Follow the instructions below:' -ForegroundColor Cyan
+        Write-Host ''
+        az login --use-device-code
+        Write-Host ''
+        $account = Invoke-AzCliJson 'account show'
+        if (-not $account) {
+            throw 'Azure CLI login failed. Run "az login --use-device-code" manually before running this command.'
         }
     }
-    $account = $accountRaw | ConvertFrom-Json
 
     if ($SubscriptionId) {
         az account set -s $SubscriptionId 2>$null
-        $accountRaw = az account show -o json 2>$null
-        $account = $accountRaw | ConvertFrom-Json
+        $account = Invoke-AzCliJson 'account show'
     }
-    Write-Log "Subscription: $($account.name) ($($account.id))" -Level Info
+    Write-Log "Subscription: $($account.name) ($($account.id))" -Level Success
 
-    # Ensure required extensions
+    # Step 3: Ensure required extensions
+    Write-Log '[Step 3/6] Checking required az CLI extensions...' -Level Info
     foreach ($ext in @('stack-hci-vm', 'connectedk8s')) {
         $extCheck = az extension show --name $ext 2>$null
         if (-not $extCheck) {
-            Write-Log "Installing az extension: $ext" -Level Info
+            Write-Log "  Installing az extension: $ext (this may take a moment)..." -Level Info
             az extension add --name $ext --yes 2>$null
+            Write-Log "  Extension $ext installed." -Level Success
+        } else {
+            Write-Log "  Extension $ext already installed." -Level Info
         }
     }
 
-    # Discover cluster
+    # Step 4: Discover cluster
+    Write-Log '[Step 4/6] Discovering Azure Local clusters...' -Level Info
     $clusters = @()
     if ($ResourceGroupName) {
-        $raw = az stack-hci cluster list -g $ResourceGroupName -o json 2>$null
-        if ($raw) { $clusters = $raw | ConvertFrom-Json }
+        Write-Log "  Querying clusters in resource group: $ResourceGroupName" -Level Info
+        $parsed = Invoke-AzCliJson "stack-hci cluster list -g $ResourceGroupName"
+        if ($parsed) { $clusters = @($parsed) }
     } else {
-        $raw = az stack-hci cluster list -o json 2>$null
-        if ($raw) { $clusters = $raw | ConvertFrom-Json }
+        Write-Log '  Querying clusters across entire subscription...' -Level Info
+        $parsed = Invoke-AzCliJson 'stack-hci cluster list'
+        if ($parsed) { $clusters = @($parsed) }
     }
+    Write-Log "  Found $($clusters.Count) cluster(s)." -Level Info
 
     $cluster = $null
     if ($ClusterName) {
@@ -311,9 +382,13 @@ function Initialize-AksArcValidation {
     $region = $cluster.location
     Write-Log "Cluster: $($cluster.name) (RG: $rg, Region: $region)" -Level Success
 
+    # Step 5: Discover infrastructure components
+    Write-Log '[Step 5/6] Discovering infrastructure (ARB, Custom Location)...' -Level Info
+
     # Discover ARB
-    $arbRaw = az arcappliance list -g $rg -o json 2>$null
-    $arbs = if ($arbRaw) { $arbRaw | ConvertFrom-Json } else { @() }
+    Write-Log '  Checking Arc Resource Bridge...' -Level Info
+    $arbs = Invoke-AzCliJson "arcappliance list -g $rg"
+    if (-not $arbs) { $arbs = @() } else { $arbs = @($arbs) }
     $arb = $arbs | Select-Object -First 1
 
     if ($arb) {
@@ -323,8 +398,9 @@ function Initialize-AksArcValidation {
     }
 
     # Discover Custom Location
-    $clRaw = az customlocation list -g $rg -o json 2>$null
-    $customLocations = if ($clRaw) { $clRaw | ConvertFrom-Json } else { @() }
+    Write-Log '  Checking Custom Location...' -Level Info
+    $customLocations = Invoke-AzCliJson "customlocation list -g $rg"
+    if (-not $customLocations) { $customLocations = @() } else { $customLocations = @($customLocations) }
     $customLoc = $customLocations | Select-Object -First 1
 
     if ($customLoc) {
@@ -356,10 +432,11 @@ function Initialize-AksArcValidation {
         Write-Log 'WARNING: Running from a remote host. Network connectivity tests validate from THIS machine, not from Azure Local nodes. For accurate firewall validation, run this module from an Azure Local node.' -Level Warning
     }
 
-    # Discover logical networks
-    $lnetRaw = az stack-hci-vm network lnet list -g $rg -o json 2>$null
-    $lnets = if ($lnetRaw) { $lnetRaw | ConvertFrom-Json } else { @() }
-    Write-Log "Logical Networks: $($lnets.Count) found" -Level Info
+    # Step 6: Discover logical networks
+    Write-Log '[Step 6/6] Discovering logical networks...' -Level Info
+    $lnets = Invoke-AzCliJson "stack-hci-vm network lnet list -g $rg"
+    if (-not $lnets) { $lnets = @() } else { $lnets = @($lnets) }
+    Write-Log "  Logical Networks: $($lnets.Count) found" -Level Info
 
     # Identify management vs AKS networks - interactive selection when not specified
     if ($lnets.Count -gt 0 -and -not $ManagementNetwork -and -not $AksNetwork) {
@@ -802,6 +879,9 @@ function Test-AksArcDeploymentReadiness {
         Test-AksArcDeploymentReadiness
 
     .EXAMPLE
+        Test-AksArcDeploymentReadiness -Report
+
+    .EXAMPLE
         $ctx = Initialize-AksArcValidation -ClusterName 'mycluster'
         $plan = New-AksArcDeploymentPlan -PlannedClusters 2 -WorkerNodes 5
         Test-AksArcDeploymentReadiness -Context $ctx -DeploymentPlan $plan -ExportPath results.xml
@@ -813,7 +893,8 @@ function Test-AksArcDeploymentReadiness {
         [string]$Region,
         [switch]$SkipNetworkTests,
         [switch]$PassThru,
-        [string]$ExportPath
+        [string]$ExportPath,
+        [switch]$Report
     )
 
     Write-Log '========================================' -Level Header
@@ -944,9 +1025,8 @@ function Test-AksArcDeploymentReadiness {
             Write-Log "  $($Context.LogicalNetworks.Count) logical network(s) found" -Level Success
 
             foreach ($lnet in $Context.LogicalNetworks) {
-                $lnetDetail = az stack-hci-vm network lnet show -g $Context.ResourceGroup -n $lnet.name -o json 2>$null
-                if ($lnetDetail) {
-                    $lnetObj = $lnetDetail | ConvertFrom-Json
+                $lnetObj = Invoke-AzCliJson "stack-hci-vm network lnet show -g $($Context.ResourceGroup) -n $($lnet.name)"
+                if ($lnetObj) {
                     $provState = $lnetObj.properties.provisioningState
 
                     # Determine role
@@ -1212,15 +1292,14 @@ function Test-AksArcDeploymentReadiness {
         $rbacPassed = $true
         try {
             # Get current identity
-            $callerRaw = az account show -o json 2>$null
-            $caller = $callerRaw | ConvertFrom-Json
+            $caller = Invoke-AzCliJson 'account show'
             $callerType = $caller.user.type  # 'user' or 'servicePrincipal'
             $callerName = $caller.user.name
 
             # Get role assignments at resource group scope
             $rgScope = "/subscriptions/$($Context.SubscriptionId)/resourceGroups/$($Context.ResourceGroup)"
-            $assignmentsRaw = az role assignment list --scope $rgScope --assignee $callerName -o json 2>$null
-            $assignments = if ($assignmentsRaw) { $assignmentsRaw | ConvertFrom-Json } else { @() }
+            $assignments = Invoke-AzCliJson "role assignment list --scope `"$rgScope`" --assignee `"$callerName`""
+            if (-not $assignments) { $assignments = @() }
 
             $roleNames = @($assignments | ForEach-Object { $_.roleDefinitionName }) | Select-Object -Unique
 
@@ -1255,9 +1334,8 @@ function Test-AksArcDeploymentReadiness {
                 # Get detailed permissions for each assigned role
                 $allPermissions = @()
                 foreach ($assignment in $assignments) {
-                    $roleDefRaw = az role definition list --name $assignment.roleDefinitionName -o json 2>$null
-                    if ($roleDefRaw) {
-                        $roleDef = $roleDefRaw | ConvertFrom-Json
+                    $roleDef = Invoke-AzCliJson "role definition list --name `"$($assignment.roleDefinitionName)`""
+                    if ($roleDef) {
                         foreach ($perm in $roleDef.permissions) {
                             $allPermissions += $perm.actions
                         }
@@ -1346,6 +1424,14 @@ function Test-AksArcDeploymentReadiness {
 
     if ($ExportPath) {
         Export-Results -Results $results -Path $ExportPath
+    }
+
+    if ($Report) {
+        $reportPath = Join-Path (Get-Location) "AksArc-Readiness-$($Context.ClusterName)-$(Get-Date -Format 'yyyyMMdd-HHmmss').html"
+        $reportParams = @{ Results = $results; OutputPath = $reportPath }
+        if ($DeploymentPlan) { $reportParams['DeploymentPlan'] = $DeploymentPlan }
+        New-AksArcReadinessReport @reportParams
+        Write-Log "Report saved: $reportPath" -Level Success
     }
 
     if ($PassThru) { return $results }
@@ -1625,7 +1711,7 @@ function Connect-AksArcServicePrincipal {
         return $false
     }
 
-    $acct = az account show -o json 2>$null | ConvertFrom-Json
+    $acct = Invoke-AzCliJson 'account show'
     Write-Log "Authenticated: $($acct.user.name) (Subscription: $($acct.name))" -Level Success
     return $true
 }
@@ -1739,8 +1825,7 @@ function Test-AksArcFleetReadiness {
     $subParam = ''
     if ($SubscriptionId) { $subParam = "--subscriptions $SubscriptionId" }
 
-    $argRaw = az graph query -q $query $subParam --first $BatchSize -o json 2>$null
-    $argResult = if ($argRaw) { $argRaw | ConvertFrom-Json } else { $null }
+    $argResult = Invoke-AzCliJson "graph query -q `"$query`" $subParam --first $BatchSize"
     $clusters = if ($argResult -and $argResult.data) { $argResult.data } else { @() }
 
     if ($ClusterResourceIds) {
@@ -1784,25 +1869,21 @@ function Test-AksArcFleetReadiness {
                 param($rg, $sub, $clId)
                 $result = @{}
 
-                # ARB
-                $arbRaw = az graph query -q "resources | where type == 'microsoft.resourcebridge/appliances' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.status, properties.provisioningState" --subscriptions $sub --first 1 -o json 2>$null
-                $result['arbData'] = if ($arbRaw) { $arbRaw } else { '{"data":[]}' }
+                # Use cmd.exe to bypass PS 5.1 native command redirection bugs
+                $arbRaw = & cmd /c "az graph query -q `"resources | where type == 'microsoft.resourcebridge/appliances' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.status, properties.provisioningState`" --subscriptions $sub --first 1 -o json 2>nul"
+                $result['arbData'] = if ($arbRaw) { $arbRaw -join "`n" } else { '{"data":[]}' }
 
-                # Custom Location
-                $clRaw = az graph query -q "resources | where type == 'microsoft.extendedlocation/customlocations' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState" --subscriptions $sub --first 1 -o json 2>$null
-                $result['clData'] = if ($clRaw) { $clRaw } else { '{"data":[]}' }
+                $clRaw = & cmd /c "az graph query -q `"resources | where type == 'microsoft.extendedlocation/customlocations' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState`" --subscriptions $sub --first 1 -o json 2>nul"
+                $result['clData'] = if ($clRaw) { $clRaw -join "`n" } else { '{"data":[]}' }
 
-                # Extensions
-                $extRaw = az graph query -q "resources | where type == 'microsoft.azurestackhci/clusters/arcextensions' or (type == 'microsoft.kubernetesconfiguration/extensions' and resourceGroup =~ '$rg') | where subscriptionId == '$sub' | project name, type, properties.provisioningState, properties.extensionType" --subscriptions $sub --first 50 -o json 2>$null
-                $result['extData'] = if ($extRaw) { $extRaw } else { '{"data":[]}' }
+                $extRaw = & cmd /c "az graph query -q `"resources | where type == 'microsoft.azurestackhci/clusters/arcextensions' or (type == 'microsoft.kubernetesconfiguration/extensions' and resourceGroup =~ '$rg') | where subscriptionId == '$sub' | project name, type, properties.provisioningState, properties.extensionType`" --subscriptions $sub --first 50 -o json 2>nul"
+                $result['extData'] = if ($extRaw) { $extRaw -join "`n" } else { '{"data":[]}' }
 
-                # Logical Networks
-                $lnetRaw = az graph query -q "resources | where type == 'microsoft.azurestackhci/logicalnetworks' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState, properties.subnets" --subscriptions $sub --first 20 -o json 2>$null
-                $result['lnetData'] = if ($lnetRaw) { $lnetRaw } else { '{"data":[]}' }
+                $lnetRaw = & cmd /c "az graph query -q `"resources | where type == 'microsoft.azurestackhci/logicalnetworks' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState, properties.subnets`" --subscriptions $sub --first 20 -o json 2>nul"
+                $result['lnetData'] = if ($lnetRaw) { $lnetRaw -join "`n" } else { '{"data":[]}' }
 
-                # AKS clusters in this RG
-                $aksRaw = az graph query -q "resources | where type == 'microsoft.kubernetes/connectedclusters' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState" --subscriptions $sub --first 50 -o json 2>$null
-                $result['aksData'] = if ($aksRaw) { $aksRaw } else { '{"data":[]}' }
+                $aksRaw = & cmd /c "az graph query -q `"resources | where type == 'microsoft.kubernetes/connectedclusters' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState`" --subscriptions $sub --first 50 -o json 2>nul"
+                $result['aksData'] = if ($aksRaw) { $aksRaw -join "`n" } else { '{"data":[]}' }
 
                 return $result
             } -ArgumentList $rg, $sub, $clId
@@ -1828,20 +1909,20 @@ function Test-AksArcFleetReadiness {
             $sub = $cl.subscriptionId
             $data = @{}
 
-            $arbRaw = az graph query -q "resources | where type == 'microsoft.resourcebridge/appliances' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.status, properties.provisioningState" --subscriptions $sub --first 1 -o json 2>$null
-            $data['arbData'] = if ($arbRaw) { $arbRaw } else { '{"data":[]}' }
+            $arbText = Invoke-AzCliRaw "graph query -q `"resources | where type == 'microsoft.resourcebridge/appliances' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.status, properties.provisioningState`" --subscriptions $sub --first 1 -o json"
+            $data['arbData'] = if ($arbText) { $arbText } else { '{"data":[]}' }
 
-            $clRaw = az graph query -q "resources | where type == 'microsoft.extendedlocation/customlocations' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState" --subscriptions $sub --first 1 -o json 2>$null
-            $data['clData'] = if ($clRaw) { $clRaw } else { '{"data":[]}' }
+            $clText = Invoke-AzCliRaw "graph query -q `"resources | where type == 'microsoft.extendedlocation/customlocations' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState`" --subscriptions $sub --first 1 -o json"
+            $data['clData'] = if ($clText) { $clText } else { '{"data":[]}' }
 
-            $extRaw = az graph query -q "resources | where type == 'microsoft.azurestackhci/clusters/arcextensions' or (type == 'microsoft.kubernetesconfiguration/extensions' and resourceGroup =~ '$rg') | where subscriptionId == '$sub' | project name, type, properties.provisioningState, properties.extensionType" --subscriptions $sub --first 50 -o json 2>$null
-            $data['extData'] = if ($extRaw) { $extRaw } else { '{"data":[]}' }
+            $extText = Invoke-AzCliRaw "graph query -q `"resources | where type == 'microsoft.azurestackhci/clusters/arcextensions' or (type == 'microsoft.kubernetesconfiguration/extensions' and resourceGroup =~ '$rg') | where subscriptionId == '$sub' | project name, type, properties.provisioningState, properties.extensionType`" --subscriptions $sub --first 50 -o json"
+            $data['extData'] = if ($extText) { $extText } else { '{"data":[]}' }
 
-            $lnetRaw = az graph query -q "resources | where type == 'microsoft.azurestackhci/logicalnetworks' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState, properties.subnets" --subscriptions $sub --first 20 -o json 2>$null
-            $data['lnetData'] = if ($lnetRaw) { $lnetRaw } else { '{"data":[]}' }
+            $lnetText = Invoke-AzCliRaw "graph query -q `"resources | where type == 'microsoft.azurestackhci/logicalnetworks' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState, properties.subnets`" --subscriptions $sub --first 20 -o json"
+            $data['lnetData'] = if ($lnetText) { $lnetText } else { '{"data":[]}' }
 
-            $aksRaw = az graph query -q "resources | where type == 'microsoft.kubernetes/connectedclusters' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState" --subscriptions $sub --first 50 -o json 2>$null
-            $data['aksData'] = if ($aksRaw) { $aksRaw } else { '{"data":[]}' }
+            $aksText = Invoke-AzCliRaw "graph query -q `"resources | where type == 'microsoft.kubernetes/connectedclusters' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState`" --subscriptions $sub --first 50 -o json"
+            $data['aksData'] = if ($aksText) { $aksText } else { '{"data":[]}' }
 
             $clusterAssessments += @{ Cluster = $cl; Data = $data }
         }
@@ -1862,7 +1943,8 @@ function Test-AksArcFleetReadiness {
         $clusterOk = ($connStatus -eq 'Connected') -and ($provState -eq 'Succeeded')
 
         # ARB
-        $arbData = ($data['arbData'] | ConvertFrom-Json).data
+        $arbParsed = ConvertFrom-AzJson $data['arbData']
+        $arbData = if ($arbParsed -and $arbParsed.data) { $arbParsed.data } else { @() }
         $arbOk = $false
         $arbStatus = 'NotFound'
         if ($arbData -and $arbData.Count -gt 0) {
@@ -1872,7 +1954,8 @@ function Test-AksArcFleetReadiness {
         }
 
         # Custom Location
-        $clData = ($data['clData'] | ConvertFrom-Json).data
+        $clParsed = ConvertFrom-AzJson $data['clData']
+        $clData = if ($clParsed -and $clParsed.data) { $clParsed.data } else { @() }
         $clOk = $false
         if ($clData -and $clData.Count -gt 0) {
             $clProv = $clData[0].'properties.provisioningState'
@@ -1881,7 +1964,8 @@ function Test-AksArcFleetReadiness {
         }
 
         # Extensions
-        $extDataParsed = ($data['extData'] | ConvertFrom-Json).data
+        $extParsed = ConvertFrom-AzJson $data['extData']
+        $extDataParsed = if ($extParsed -and $extParsed.data) { $extParsed.data } else { @() }
         $extTotal = if ($extDataParsed) { $extDataParsed.Count } else { 0 }
         $extFailed = 0
         $failedExtNames = @()
@@ -1898,7 +1982,8 @@ function Test-AksArcFleetReadiness {
         $extOk = ($extFailed -eq 0)
 
         # Logical Networks
-        $lnetDataParsed = ($data['lnetData'] | ConvertFrom-Json).data
+        $lnetParsed = ConvertFrom-AzJson $data['lnetData']
+        $lnetDataParsed = if ($lnetParsed -and $lnetParsed.data) { $lnetParsed.data } else { @() }
         $lnetTotal = if ($lnetDataParsed) { $lnetDataParsed.Count } else { 0 }
         $lnetFailed = 0
         if ($lnetDataParsed) {
@@ -1911,7 +1996,8 @@ function Test-AksArcFleetReadiness {
         $lnetOk = ($lnetTotal -gt 0 -and $lnetFailed -eq 0)
 
         # AKS Clusters in this RG
-        $aksDataParsed = ($data['aksData'] | ConvertFrom-Json).data
+        $aksParsed = ConvertFrom-AzJson $data['aksData']
+        $aksDataParsed = if ($aksParsed -and $aksParsed.data) { $aksParsed.data } else { @() }
         $aksClusterCount = if ($aksDataParsed) { $aksDataParsed.Count } else { 0 }
 
         # Determine warnings
@@ -2045,8 +2131,8 @@ function Get-AksArcFleetProgress {
     $rgExt = az extension show --name resource-graph 2>$null
     if (-not $rgExt) { az extension add --name resource-graph --yes 2>$null }
 
-    $raw = az graph query -q $query $subParam --first 500 -o json 2>$null
-    $data = if ($raw) { ($raw | ConvertFrom-Json).data } else { @() }
+    $graphResult = Invoke-AzCliJson "graph query -q `"$query`" $subParam --first 500"
+    $data = if ($graphResult -and $graphResult.data) { $graphResult.data } else { @() }
 
     $total = $data.Count
     $connected = @($data | Where-Object {
@@ -2058,10 +2144,10 @@ function Get-AksArcFleetProgress {
 
     # Count AKS clusters
     $aksQuery = "resources | where type == 'microsoft.kubernetes/connectedclusters' | summarize count()"
-    $aksRaw = az graph query -q $aksQuery $subParam --first 1 -o json 2>$null
     $aksCount = 0
-    if ($aksRaw) {
-        $aksData = ($aksRaw | ConvertFrom-Json).data
+    $aksGraphResult = Invoke-AzCliJson "graph query -q `"$aksQuery`" $subParam --first 1"
+    if ($aksGraphResult) {
+        $aksData = $aksGraphResult.data
         if ($aksData -and $aksData.Count -gt 0) {
             $aksCount = $aksData[0].count_
             if (-not $aksCount) { $aksCount = $aksData[0].'count_' }

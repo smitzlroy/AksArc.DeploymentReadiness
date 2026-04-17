@@ -3,7 +3,7 @@
     # Generated on: 2026-04-15
 
     RootModule        = 'AksArc.DeploymentReadiness.psm1'
-    ModuleVersion     = '0.6.1'
+    ModuleVersion     = '0.7.0'
     GUID              = 'a3e7c1d9-4f2b-4e8a-9d6c-1b5f3e7a2c4d'
     Author            = 'smitzlroy'
     CompanyName       = 'Community'
@@ -37,7 +37,7 @@
             Tags         = @('AKS', 'AKS-Arc', 'Azure-Local', 'Azure-Stack-HCI', 'Readiness', 'Validation', 'Firewall', 'Endpoints', 'Fleet', 'OT')
             LicenseUri   = 'https://github.com/smitzlroy/AksArc.DeploymentReadiness/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/smitzlroy/AksArc.DeploymentReadiness'
-            ReleaseNotes = 'v0.6.1: Fix Windows PowerShell 5.1 compatibility - replace non-ASCII characters and add UTF-8 BOM for correct parsing on Azure Local nodes.'
+            ReleaseNotes = 'v0.7.0: Fix az CLI JSON parsing on Windows PowerShell 5.1 - use System.Diagnostics.Process to bypass PS 5.1 native command pipeline bugs that lose stdout data. All az CLI calls now use dedicated helpers (Invoke-AzCliJson, Invoke-AzCliRaw) for reliable cross-version operation.'
         }
     }
 }
