@@ -3,7 +3,7 @@
     # Generated on: 2026-04-15
 
     RootModule        = 'AksArc.DeploymentReadiness.psm1'
-    ModuleVersion     = '0.7.0'
+    ModuleVersion     = '0.7.1'
     GUID              = 'a3e7c1d9-4f2b-4e8a-9d6c-1b5f3e7a2c4d'
     Author            = 'smitzlroy'
     CompanyName       = 'Community'
@@ -37,7 +37,7 @@
             Tags         = @('AKS', 'AKS-Arc', 'Azure-Local', 'Azure-Stack-HCI', 'Readiness', 'Validation', 'Firewall', 'Endpoints', 'Fleet', 'OT')
             LicenseUri   = 'https://github.com/smitzlroy/AksArc.DeploymentReadiness/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/smitzlroy/AksArc.DeploymentReadiness'
-            ReleaseNotes = 'v0.7.0: Fix az CLI JSON parsing on Windows PowerShell 5.1 - use System.Diagnostics.Process to bypass PS 5.1 native command pipeline bugs that lose stdout data. All az CLI calls now use dedicated helpers (Invoke-AzCliJson, Invoke-AzCliRaw) for reliable cross-version operation.'
+            ReleaseNotes = 'v0.7.1: Fix cluster discovery on Azure Local nodes - add missing stack-hci extension to required list, resolve full az CLI path for cmd.exe, add az resource list fallback for cluster discovery, log az CLI errors for diagnostics.'
         }
     }
 }

@@ -13,7 +13,7 @@ Describe 'AksArc.DeploymentReadiness Module' {
         It 'Module manifest is valid' {
             $manifest = Test-ModuleManifest -Path (Join-Path $PSScriptRoot '..' 'AksArc.DeploymentReadiness.psd1')
             $manifest | Should -Not -BeNullOrEmpty
-            $manifest.Version | Should -Be '0.7.0'
+            $manifest.Version | Should -Be '0.7.1'
         }
 
         It 'Exports exactly 10 functions' {

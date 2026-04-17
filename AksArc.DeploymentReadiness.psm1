@@ -122,9 +122,15 @@ function Invoke-AzCliJson {
         PS 5.1 native command stderr/stdout redirection bugs.
     #>
     param([string]$Arguments)
+    # Resolve full path to az CLI to avoid PATH differences between PowerShell and cmd.exe
+    if (-not $script:AzCliPath) {
+        $azCmd = Get-Command az -ErrorAction SilentlyContinue
+        if ($azCmd) { $script:AzCliPath = $azCmd.Source }
+    }
+    $azExe = if ($script:AzCliPath) { "`"$($script:AzCliPath)`"" } else { 'az' }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'cmd.exe'
-    $psi.Arguments = "/c az $Arguments -o json 2>nul"
+    $psi.Arguments = "/c $azExe $Arguments -o json 2>&1"
     $psi.RedirectStandardOutput = $true
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
@@ -132,10 +138,15 @@ function Invoke-AzCliJson {
         $proc = [System.Diagnostics.Process]::Start($psi)
         $stdout = $proc.StandardOutput.ReadToEnd()
         $proc.WaitForExit()
-        if ($proc.ExitCode -ne 0) { return $null }
+        if ($proc.ExitCode -ne 0) {
+            # Log stderr/error info for diagnostics (first 200 chars)
+            $errSnippet = if ($stdout.Length -gt 200) { $stdout.Substring(0,200) + '...' } else { $stdout }
+            Write-Log "  az $Arguments failed (exit $($proc.ExitCode)): $errSnippet" -Level Warning
+            return $null
+        }
         return (ConvertFrom-AzJson $stdout)
     } catch {
-        Write-Log "  Invoke-AzCliJson failed: $($_.Exception.Message)" -Level Warning
+        Write-Log "  Invoke-AzCliJson exception: $($_.Exception.Message)" -Level Warning
         return $null
     }
 }
@@ -147,9 +158,14 @@ function Invoke-AzCliRaw {
         Uses System.Diagnostics.Process to bypass PS 5.1 redirection bugs.
     #>
     param([string]$Arguments)
+    if (-not $script:AzCliPath) {
+        $azCmd = Get-Command az -ErrorAction SilentlyContinue
+        if ($azCmd) { $script:AzCliPath = $azCmd.Source }
+    }
+    $azExe = if ($script:AzCliPath) { "`"$($script:AzCliPath)`"" } else { 'az' }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'cmd.exe'
-    $psi.Arguments = "/c az $Arguments 2>nul"
+    $psi.Arguments = "/c $azExe $Arguments 2>nul"
     $psi.RedirectStandardOutput = $true
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
@@ -333,18 +349,18 @@ function Initialize-AksArcValidation {
     }
 
     if ($SubscriptionId) {
-        az account set -s $SubscriptionId 2>$null
+        Invoke-AzCliRaw "account set -s $SubscriptionId"
         $account = Invoke-AzCliJson 'account show'
     }
     Write-Log "Subscription: $($account.name) ($($account.id))" -Level Success
 
     # Step 3: Ensure required extensions
     Write-Log '[Step 3/6] Checking required az CLI extensions...' -Level Info
-    foreach ($ext in @('stack-hci-vm', 'connectedk8s')) {
-        $extCheck = az extension show --name $ext 2>$null
-        if (-not $extCheck) {
+    foreach ($ext in @('stack-hci', 'stack-hci-vm', 'connectedk8s')) {
+        $extInfo = Invoke-AzCliJson "extension show --name $ext"
+        if (-not $extInfo) {
             Write-Log "  Installing az extension: $ext (this may take a moment)..." -Level Info
-            az extension add --name $ext --yes 2>$null
+            Invoke-AzCliRaw "extension add --name $ext --yes"
             Write-Log "  Extension $ext installed." -Level Success
         } else {
             Write-Log "  Extension $ext already installed." -Level Info
@@ -357,10 +373,18 @@ function Initialize-AksArcValidation {
     if ($ResourceGroupName) {
         Write-Log "  Querying clusters in resource group: $ResourceGroupName" -Level Info
         $parsed = Invoke-AzCliJson "stack-hci cluster list -g $ResourceGroupName"
+        if (-not $parsed) {
+            Write-Log '  stack-hci extension query returned no results, trying az resource list...' -Level Warning
+            $parsed = Invoke-AzCliJson "resource list -g $ResourceGroupName --resource-type Microsoft.AzureStackHCI/clusters"
+        }
         if ($parsed) { $clusters = @($parsed) }
     } else {
         Write-Log '  Querying clusters across entire subscription...' -Level Info
         $parsed = Invoke-AzCliJson 'stack-hci cluster list'
+        if (-not $parsed) {
+            Write-Log '  stack-hci extension query returned no results, trying az resource list...' -Level Warning
+            $parsed = Invoke-AzCliJson "resource list --resource-type Microsoft.AzureStackHCI/clusters"
+        }
         if ($parsed) { $clusters = @($parsed) }
     }
     Write-Log "  Found $($clusters.Count) cluster(s)." -Level Info
@@ -1801,9 +1825,9 @@ function Test-AksArcFleetReadiness {
     Write-Log '========================================' -Level Header
 
     # Ensure resource-graph extension
-    $rgExt = az extension show --name resource-graph 2>$null
+    $rgExt = Invoke-AzCliJson 'extension show --name resource-graph'
     if (-not $rgExt) {
-        az extension add --name resource-graph --yes 2>$null
+        Invoke-AzCliRaw 'extension add --name resource-graph --yes'
     }
 
     # Build ARG query to find clusters
