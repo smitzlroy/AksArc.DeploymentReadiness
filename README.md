@@ -97,6 +97,28 @@ Import-Module ./AksArc.DeploymentReadiness/AksArc.DeploymentReadiness.psd1
 ```powershell
 Import-Module AksArc.DeploymentReadiness
 
+# One-liner on a cluster node - the module auto-detects YOUR cluster via
+# Get-Cluster + azcmagent, then looks it up directly in Azure. No
+# subscription-scope Reader required.
+Test-AksArcDeploymentReadiness -Report
+```
+
+### "Run from a management workstation against a specific cluster"
+
+```powershell
+# Direct lookup - needs only 'Reader' on that one cluster resource.
+Test-AksArcDeploymentReadiness `
+    -SubscriptionId    'fbaf508b-cb61-4383-9cda-a42bfa0c7bc9' `
+    -ResourceGroupName 'london' `
+    -ClusterName       'london' `
+    -Report
+```
+
+### "Full control with a deployment plan"
+
+```powershell
+Import-Module AksArc.DeploymentReadiness
+
 # 1. Auto-discover your cluster infrastructure
 $ctx = Initialize-AksArcValidation -ManagementNetwork 'mgmt-lnet' -AksNetwork 'aks-lnet'
 

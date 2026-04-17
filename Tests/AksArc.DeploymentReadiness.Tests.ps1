@@ -13,12 +13,12 @@ Describe 'AksArc.DeploymentReadiness Module' {
         It 'Module manifest is valid' {
             $manifest = Test-ModuleManifest -Path (Join-Path $PSScriptRoot '..' 'AksArc.DeploymentReadiness.psd1')
             $manifest | Should -Not -BeNullOrEmpty
-            $manifest.Version | Should -Be '0.7.2'
+            $manifest.Version | Should -Be '0.8.0'
         }
 
-        It 'Exports exactly 10 functions' {
+        It 'Exports exactly 11 functions' {
             $commands = Get-Command -Module AksArc.DeploymentReadiness
-            $commands.Count | Should -Be 10
+            $commands.Count | Should -Be 11
         }
 
         It 'Exports expected function names' {
@@ -27,6 +27,7 @@ Describe 'AksArc.DeploymentReadiness Module' {
                 'Export-AksArcFirewallRules'
                 'Get-AksArcEndpointReference'
                 'Get-AksArcFleetProgress'
+                'Get-AksArcLocalContext'
                 'Initialize-AksArcValidation'
                 'New-AksArcDeploymentPlan'
                 'New-AksArcReadinessReport'
@@ -537,6 +538,57 @@ Describe 'AksArc.DeploymentReadiness Module' {
         It 'AksNetwork accepts string type' {
             $cmd = Get-Command Initialize-AksArcValidation
             $cmd.Parameters['AksNetwork'].ParameterType | Should -Be ([string])
+        }
+    }
+
+    Context 'v0.8.0 node-local cluster resolution' {
+
+        It 'Exports Get-AksArcLocalContext' {
+            Get-Command Get-AksArcLocalContext -Module AksArc.DeploymentReadiness -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
+        }
+
+        It 'Get-AksArcLocalContext takes no mandatory parameters' {
+            $cmd = Get-Command Get-AksArcLocalContext
+            $mandatory = $cmd.Parameters.Values | Where-Object {
+                $_.Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] -and $_.Mandatory }
+            }
+            $mandatory | Should -BeNullOrEmpty
+        }
+
+        It 'Get-AksArcLocalContext returns $null when not on an Azure Local node' {
+            # Dev / CI boxes will not have both Get-Cluster + azcmagent configured.
+            $result = Get-AksArcLocalContext -ErrorAction SilentlyContinue
+            if ($null -ne $result) {
+                # If we do happen to be on a node, the shape must be correct.
+                $result.IsAzureLocalNode | Should -Be $true
+                $result.SubscriptionId | Should -Not -BeNullOrEmpty
+                $result.ResourceGroupName | Should -Not -BeNullOrEmpty
+                $result.ClusterName | Should -Not -BeNullOrEmpty
+            } else {
+                $result | Should -BeNullOrEmpty
+            }
+        }
+
+        It 'Test-AksArcDeploymentReadiness exposes -ClusterName parameter' {
+            $cmd = Get-Command Test-AksArcDeploymentReadiness
+            $cmd.Parameters.ContainsKey('ClusterName') | Should -Be $true
+            $cmd.Parameters['ClusterName'].ParameterType | Should -Be ([string])
+        }
+
+        It 'Test-AksArcDeploymentReadiness exposes -ResourceGroupName parameter' {
+            $cmd = Get-Command Test-AksArcDeploymentReadiness
+            $cmd.Parameters.ContainsKey('ResourceGroupName') | Should -Be $true
+        }
+
+        It 'Test-AksArcDeploymentReadiness exposes -SubscriptionId parameter' {
+            $cmd = Get-Command Test-AksArcDeploymentReadiness
+            $cmd.Parameters.ContainsKey('SubscriptionId') | Should -Be $true
+        }
+
+        It 'Test-AksArcDeploymentReadiness exposes -ManagementNetwork / -AksNetwork pass-through' {
+            $cmd = Get-Command Test-AksArcDeploymentReadiness
+            $cmd.Parameters.ContainsKey('ManagementNetwork') | Should -Be $true
+            $cmd.Parameters.ContainsKey('AksNetwork')        | Should -Be $true
         }
     }
 }

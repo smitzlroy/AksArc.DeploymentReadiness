@@ -3,7 +3,7 @@
     # Generated on: 2026-04-15
 
     RootModule        = 'AksArc.DeploymentReadiness.psm1'
-    ModuleVersion     = '0.7.2'
+    ModuleVersion     = '0.8.0'
     GUID              = 'a3e7c1d9-4f2b-4e8a-9d6c-1b5f3e7a2c4d'
     Author            = 'smitzlroy'
     CompanyName       = 'Community'
@@ -25,6 +25,7 @@
         'Get-AksArcFleetProgress'
         'Connect-AksArcServicePrincipal'
         'New-AksArcReadinessReport'
+        'Get-AksArcLocalContext'
     )
 
     CmdletsToExport   = @()
@@ -37,7 +38,7 @@
             Tags         = @('AKS', 'AKS-Arc', 'Azure-Local', 'Azure-Stack-HCI', 'Readiness', 'Validation', 'Firewall', 'Endpoints', 'Fleet', 'OT')
             LicenseUri   = 'https://github.com/smitzlroy/AksArc.DeploymentReadiness/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/smitzlroy/AksArc.DeploymentReadiness'
-            ReleaseNotes = 'v0.7.2: Fix az CLI JSON parsing on Azure Local nodes - separate stdout/stderr via .NET RedirectStandardError so az CLI warnings never contaminate JSON output. Harden ConvertFrom-AzJson to strip trailing non-JSON text. Replace all remaining bare az calls with Process-based helpers. Pass resolved az CLI path into parallel job blocks.'
+            ReleaseNotes = 'v0.8.0: Node-local cluster resolution. Initialize-AksArcValidation now auto-detects the local Azure Local cluster via Get-Cluster + azcmagent when run on a node, and uses `az resource show` for direct lookup (no subscription-wide Reader required). Test-AksArcDeploymentReadiness accepts -ClusterName / -ResourceGroupName / -SubscriptionId directly so it works without an explicit Initialize call. Subscription-wide enumeration is now a last-resort fallback for management workstations. New public helper Get-AksArcLocalContext. Context gains ResolveMode field (Explicit | AzureLocalNode | SubscriptionDiscovery).'
         }
     }
 }

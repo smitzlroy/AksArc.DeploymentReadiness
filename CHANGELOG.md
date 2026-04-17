@@ -5,6 +5,39 @@ All notable changes to the **AksArc.DeploymentReadiness** module will be documen
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-04-17
+
+### Added
+
+- **Node-local cluster resolution.** `Initialize-AksArcValidation` now auto-detects the local cluster via `Get-Cluster` + `azcmagent show -j` when it is running on an Azure Local (Azure Stack HCI) node, and then performs a direct `az resource show` against that specific cluster. Customers no longer need subscription-scope Reader permissions to run readiness checks from a node.
+- **`Get-AksArcLocalContext`** - public helper that returns the subscription / resource group / cluster / tenant / location for the current node (or `$null` off-node). Useful for scripting and diagnostics.
+- **`Test-AksArcDeploymentReadiness` direct parameters** - `-ClusterName`, `-ResourceGroupName`, `-SubscriptionId`, `-ManagementNetwork`, and `-AksNetwork` can now be passed straight to `Test-AksArcDeploymentReadiness`, which forwards them to `Initialize-AksArcValidation` internally. Calling `Test-AksArcDeploymentReadiness -ClusterName 'london' -ResourceGroupName 'london'` now works without a separate `Initialize` step.
+- **Context `ResolveMode` field** - `Explicit`, `AzureLocalNode`, or `SubscriptionDiscovery` so callers can see how the cluster was located.
+
+### Changed
+
+- **Cluster discovery priority.** Resolution order is now: (1) explicit `-ClusterName` + `-ResourceGroupName` → direct lookup, (2) local Azure Local node → direct lookup using node identity, (3) subscription-wide enumeration as a last-resort fallback for management workstations. Paths 1 and 2 need only `Reader` on the single cluster resource, not on the whole subscription.
+- Better error messages when direct lookup fails, pointing to the specific RBAC scope or cluster-name mismatch that is the likely cause.
+
+### Fixed
+
+- Cluster discovery on nodes whose signed-in identity has no subscription-scope Reader role (the most common real-world Azure Local customer scenario). Previously `stack-hci cluster list` and `resource list` both returned zero items and the module threw; now the node's own cluster is found via local sources of truth.
+
+## [0.7.2] - 2026-04-17
+
+### Fixed
+
+- Azure CLI JSON parsing on Azure Local nodes: `Invoke-AzCliJson` / `Invoke-AzCliRaw` now use `System.Diagnostics.Process` with `RedirectStandardError=$true`, so Azure CLI's "update available" stderr warnings no longer contaminate stdout and break JSON parsing.
+- Hardened `ConvertFrom-AzJson` to find the last matching `]` / `}` so trailing non-JSON text is stripped.
+- Replaced remaining bare `az` calls (including those inside parallel `Start-Job` blocks) with the process-based helpers, and resolved the `az` path once so PATH differences between PowerShell and cmd.exe no longer matter.
+
+## [0.7.1] - 2026-04-17
+
+### Changed
+
+- Added `stack-hci` extension to the required-extensions check.
+- Added `az resource list --resource-type Microsoft.AzureStackHCI/clusters` as a fallback when `stack-hci cluster list` returns nothing.
+
 ## [0.6.0] - 2026-04-16
 
 ### Added
@@ -15,8 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - LNET discovery listing now includes IP pool count per network.
-- Module version bumped to 0.6.0.
-- Updated `ReleaseNotes` in module manifest to reflect current feature set.
 
 ### Fixed
 

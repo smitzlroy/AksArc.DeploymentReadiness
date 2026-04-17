@@ -196,6 +196,109 @@ function Invoke-AzCliRaw {
     }
 }
 
+function Get-AksArcLocalContext {
+    <#
+    .SYNOPSIS
+        Detects whether this script is running on an Azure Local (Azure Stack HCI) node and
+        returns the subscription / resource group / cluster identifying that node.
+
+    .DESCRIPTION
+        A node in an Azure Local cluster already knows which cluster it belongs to; subscription-
+        wide enumeration is unnecessary (and often fails because the node's identity has no
+        subscription-scope Reader role).
+
+        This helper combines two local sources of truth:
+          * `Get-Cluster` (Failover Clustering)            - cluster name as registered in Windows.
+          * `azcmagent show -j`                            - subscription, resource group, tenant,
+                                                             and location from the Arc agent.
+
+        On an Azure Local node the failover cluster name and the HCI cluster resource name match
+        (Azure Local deployment guarantees this), and the cluster resource lives in the same RG
+        as the Arc-enrolled machines.
+
+        Returns $null when any required data point is missing (i.e. not running on a node).
+    #>
+    [CmdletBinding()]
+    param()
+
+    $result = [PSCustomObject]@{
+        IsAzureLocalNode  = $false
+        SubscriptionId    = $null
+        TenantId          = $null
+        ResourceGroupName = $null
+        ClusterName       = $null
+        Location          = $null
+        NodeName          = $env:COMPUTERNAME
+        Source            = $null
+    }
+
+    # 1. Failover cluster name (local, no network call).
+    $clusterName = $null
+    try {
+        if (Get-Command Get-Cluster -ErrorAction SilentlyContinue) {
+            $fc = Get-Cluster -ErrorAction Stop
+            if ($fc -and $fc.Name) { $clusterName = [string]$fc.Name }
+        }
+    } catch {
+        Write-Verbose "Get-Cluster failed: $($_.Exception.Message)"
+    }
+    if (-not $clusterName) { return $null }
+
+    # 2. Arc agent info via azcmagent.
+    $azcmagentPaths = @(
+        'azcmagent',
+        "$env:ProgramFiles\AzureConnectedMachineAgent\azcmagent.exe",
+        "$env:ProgramW6432\AzureConnectedMachineAgent\azcmagent.exe"
+    ) | Where-Object { $_ }
+
+    $azcmExe = $null
+    foreach ($p in $azcmagentPaths) {
+        $cmd = Get-Command $p -ErrorAction SilentlyContinue
+        if ($cmd) { $azcmExe = $cmd.Source; break }
+    }
+    if (-not $azcmExe) { return $null }
+
+    # Call `azcmagent show -j` via ProcessStartInfo to keep stderr separate.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $azcmExe
+    $psi.Arguments = 'show -j'
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $stdout = $null
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $null = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { return $null }
+    } catch {
+        Write-Verbose "azcmagent show failed: $($_.Exception.Message)"
+        return $null
+    }
+
+    $agent = ConvertFrom-AzJson $stdout
+    if (-not $agent) { return $null }
+
+    # Field names in azcmagent JSON use lowerCamelCase.
+    $subId    = $agent.subscriptionId
+    $tenantId = $agent.tenantId
+    $rg       = $agent.resourceGroup
+    $location = $agent.location
+
+    if (-not $subId -or -not $rg) { return $null }
+
+    $result.IsAzureLocalNode  = $true
+    $result.SubscriptionId    = $subId
+    $result.TenantId          = $tenantId
+    $result.ResourceGroupName = $rg
+    $result.ClusterName       = $clusterName
+    $result.Location          = $location
+    $result.Source            = 'AzureLocalNode(Get-Cluster+azcmagent)'
+    return $result
+}
+
 function Invoke-AzRestCall {
     param(
         [string]$Uri,
@@ -383,44 +486,99 @@ function Initialize-AksArcValidation {
         }
     }
 
-    # Step 4: Discover cluster
-    Write-Log '[Step 4/6] Discovering Azure Local clusters...' -Level Info
-    $clusters = @()
-    if ($ResourceGroupName) {
-        Write-Log "  Querying clusters in resource group: $ResourceGroupName" -Level Info
-        $parsed = Invoke-AzCliJson "stack-hci cluster list -g $ResourceGroupName"
-        if (-not $parsed) {
-            Write-Log '  stack-hci extension query returned no results, trying az resource list...' -Level Warning
-            $parsed = Invoke-AzCliJson "resource list -g $ResourceGroupName --resource-type Microsoft.AzureStackHCI/clusters"
-        }
-        if ($parsed) { $clusters = @($parsed) }
-    } else {
-        Write-Log '  Querying clusters across entire subscription...' -Level Info
-        $parsed = Invoke-AzCliJson 'stack-hci cluster list'
-        if (-not $parsed) {
-            Write-Log '  stack-hci extension query returned no results, trying az resource list...' -Level Warning
-            $parsed = Invoke-AzCliJson "resource list --resource-type Microsoft.AzureStackHCI/clusters"
-        }
-        if ($parsed) { $clusters = @($parsed) }
-    }
-    Write-Log "  Found $($clusters.Count) cluster(s)." -Level Info
-
+    # Step 4: Resolve target cluster.
+    # Priority order (node-local scenario first, subscription enumeration last):
+    #   1) -ClusterName + -ResourceGroupName provided       -> direct `az resource show`
+    #   2) Running on an Azure Local node                   -> auto-detect + direct `az resource show`
+    #   3) Management workstation (no node, no params)      -> subscription-wide list
+    Write-Log '[Step 4/6] Resolving target Azure Local cluster...' -Level Info
     $cluster = $null
-    if ($ClusterName) {
-        $cluster = $clusters | Where-Object { $_.name -eq $ClusterName } | Select-Object -First 1
-    } elseif ($clusters.Count -eq 1) {
-        $cluster = $clusters[0]
-    } elseif ($clusters.Count -gt 1) {
-        Write-Log "Found $($clusters.Count) clusters. Specify -ClusterName." -Level Warning
-        $clusters | ForEach-Object { Write-Log "  $($_.name) (RG: $($_.resourceGroup))" -Level Info }
-        throw "Multiple clusters found. Use -ClusterName to select one."
-    } else {
-        throw "No Azure Local clusters found in subscription $($account.id)."
+    $resolveMode = $null
+
+    # --- Path 1: explicit parameters --------------------------------------------------
+    if ($ClusterName -and $ResourceGroupName) {
+        $resolveMode = 'Explicit'
+        Write-Log "  Using explicit -ClusterName '$ClusterName' in -ResourceGroupName '$ResourceGroupName'." -Level Info
+        $clusterUri = "/subscriptions/$($account.id)/resourceGroups/$ResourceGroupName/providers/Microsoft.AzureStackHCI/clusters/$ClusterName"
+        $cluster = Invoke-AzCliJson "resource show --ids `"$clusterUri`""
+        if (-not $cluster) {
+            throw "Cluster '$ClusterName' not found in resource group '$ResourceGroupName' (subscription $($account.id)). Verify the name, the az CLI has 'Reader' on the cluster, and that the subscription context is correct."
+        }
     }
 
-    $rg = $cluster.resourceGroup
+    # --- Path 2: running on an Azure Local node --------------------------------------
+    if (-not $cluster) {
+        $local = Get-AksArcLocalContext
+        if ($local -and $local.IsAzureLocalNode) {
+            $resolveMode = 'AzureLocalNode'
+            Write-Log "  Detected Azure Local node '$($local.NodeName)' - cluster '$($local.ClusterName)' in RG '$($local.ResourceGroupName)' (sub $($local.SubscriptionId))." -Level Success
+
+            # If node's subscription differs from current az context, switch context.
+            if ($local.SubscriptionId -and $account.id -ne $local.SubscriptionId) {
+                Write-Log "  Switching az context to node's subscription: $($local.SubscriptionId)" -Level Info
+                Invoke-AzCliRaw "account set -s $($local.SubscriptionId)" | Out-Null
+                $account = Invoke-AzCliJson 'account show'
+            }
+
+            # Honor a caller override on just one of the two values.
+            if (-not $ClusterName)       { $ClusterName       = $local.ClusterName }
+            if (-not $ResourceGroupName) { $ResourceGroupName = $local.ResourceGroupName }
+
+            $clusterUri = "/subscriptions/$($account.id)/resourceGroups/$ResourceGroupName/providers/Microsoft.AzureStackHCI/clusters/$ClusterName"
+            $cluster = Invoke-AzCliJson "resource show --ids `"$clusterUri`""
+            if (-not $cluster) {
+                Write-Log "  Direct lookup failed for '$ClusterName' in '$ResourceGroupName'. The node identity may lack 'Reader' on the cluster resource, or the HCI cluster resource name differs from the failover cluster name." -Level Warning
+            }
+        }
+    }
+
+    # --- Path 3: management workstation fallback -------------------------------------
+    if (-not $cluster) {
+        $resolveMode = 'SubscriptionDiscovery'
+        Write-Log '  No local node context. Falling back to subscription-wide discovery (requires subscription-scope Reader).' -Level Info
+        $clusters = @()
+        if ($ResourceGroupName) {
+            $parsed = Invoke-AzCliJson "stack-hci cluster list -g $ResourceGroupName"
+            if (-not $parsed) {
+                $parsed = Invoke-AzCliJson "resource list -g $ResourceGroupName --resource-type Microsoft.AzureStackHCI/clusters"
+            }
+            if ($parsed) { $clusters = @($parsed) }
+        } else {
+            $parsed = Invoke-AzCliJson 'stack-hci cluster list'
+            if (-not $parsed) {
+                $parsed = Invoke-AzCliJson "resource list --resource-type Microsoft.AzureStackHCI/clusters"
+            }
+            if ($parsed) { $clusters = @($parsed) }
+        }
+        Write-Log "  Found $($clusters.Count) cluster(s) in scope." -Level Info
+
+        if ($ClusterName) {
+            $cluster = $clusters | Where-Object { $_.name -eq $ClusterName } | Select-Object -First 1
+            if (-not $cluster) {
+                throw "Cluster '$ClusterName' not found. Pass -ResourceGroupName to scope the lookup, or verify RBAC."
+            }
+        } elseif ($clusters.Count -eq 1) {
+            $cluster = $clusters[0]
+        } elseif ($clusters.Count -gt 1) {
+            Write-Log "Found $($clusters.Count) clusters. Specify -ClusterName (and ideally -ResourceGroupName)." -Level Warning
+            $clusters | ForEach-Object { Write-Log "  $($_.name) (RG: $($_.resourceGroup))" -Level Info }
+            throw 'Multiple clusters found. Use -ClusterName (+ -ResourceGroupName) to select one.'
+        } else {
+            throw "No Azure Local clusters visible in subscription $($account.id). If you are running on a cluster node, ensure the Connected Machine agent is healthy (azcmagent show) and that the Failover Clustering feature is enabled. If running remotely, pass -ClusterName and -ResourceGroupName explicitly."
+        }
+    }
+
+    # Normalize shape - `az resource show` and `stack-hci cluster list` both expose
+    # .name / .location / .id; only `resource list` adds a top-level .resourceGroup.
+    $rg = if ($cluster.resourceGroup) {
+        $cluster.resourceGroup
+    } elseif ($ResourceGroupName) {
+        $ResourceGroupName
+    } elseif ($cluster.id -match '/resourceGroups/([^/]+)/') {
+        $Matches[1]
+    } else { $null }
     $region = $cluster.location
-    Write-Log "Cluster: $($cluster.name) (RG: $rg, Region: $region)" -Level Success
+    Write-Log "Cluster: $($cluster.name) (RG: $rg, Region: $region) [resolve mode: $resolveMode]" -Level Success
 
     # Step 5: Discover infrastructure components
     Write-Log '[Step 5/6] Discovering infrastructure (ARB, Custom Location)...' -Level Info
@@ -545,6 +703,7 @@ function Initialize-AksArcValidation {
         AksSubnetTestIP    = $AksSubnetTestIP
         ClusterIP          = $ClusterIP
         HostType           = $hostType
+        ResolveMode        = $resolveMode
         Timestamp          = (Get-Date -Format 'o')
     }
 
@@ -898,7 +1057,26 @@ function Test-AksArcDeploymentReadiness {
         deep IP capacity validation against the logical network IP pools.
 
     .PARAMETER Context
-        Context object from Initialize-AksArcValidation. If not provided, runs Initialize-AksArcValidation.
+        Context object from Initialize-AksArcValidation. If not provided, Initialize-AksArcValidation
+        is called automatically (forwarding -SubscriptionId / -ResourceGroupName / -ClusterName /
+        -ManagementNetwork / -AksNetwork when supplied).
+
+    .PARAMETER SubscriptionId
+        Azure subscription ID. Forwarded to Initialize-AksArcValidation when -Context is not supplied.
+
+    .PARAMETER ResourceGroupName
+        Resource group holding the Azure Local cluster. When combined with -ClusterName the module
+        skips subscription-wide enumeration and queries the cluster directly (only needs Reader
+        on that cluster resource).
+
+    .PARAMETER ClusterName
+        Azure Local cluster name. Pass together with -ResourceGroupName for direct lookup.
+
+    .PARAMETER ManagementNetwork
+        Name of the logical network used for management traffic.
+
+    .PARAMETER AksNetwork
+        Name of the logical network used for AKS Arc workload VMs.
 
     .PARAMETER DeploymentPlan
         Deployment plan from New-AksArcDeploymentPlan. Enables IP capacity validation in Gate 5.
@@ -919,7 +1097,13 @@ function Test-AksArcDeploymentReadiness {
         Test-AksArcDeploymentReadiness
 
     .EXAMPLE
+        # Run from an Azure Local node - no parameters needed, cluster is auto-detected.
         Test-AksArcDeploymentReadiness -Report
+
+    .EXAMPLE
+        # Run from a management workstation targeting a specific cluster (direct lookup,
+        # no subscription-wide enumeration required).
+        Test-AksArcDeploymentReadiness -ClusterName 'london' -ResourceGroupName 'london'
 
     .EXAMPLE
         $ctx = Initialize-AksArcValidation -ClusterName 'mycluster'
@@ -931,6 +1115,11 @@ function Test-AksArcDeploymentReadiness {
         [PSCustomObject]$Context,
         [PSCustomObject]$DeploymentPlan,
         [string]$Region,
+        [string]$SubscriptionId,
+        [string]$ResourceGroupName,
+        [string]$ClusterName,
+        [string]$ManagementNetwork,
+        [string]$AksNetwork,
         [switch]$SkipNetworkTests,
         [switch]$PassThru,
         [string]$ExportPath,
@@ -942,7 +1131,13 @@ function Test-AksArcDeploymentReadiness {
     Write-Log '========================================' -Level Header
 
     if (-not $Context) {
-        $Context = Initialize-AksArcValidation
+        $initParams = @{}
+        if ($SubscriptionId)    { $initParams.SubscriptionId    = $SubscriptionId }
+        if ($ResourceGroupName) { $initParams.ResourceGroupName = $ResourceGroupName }
+        if ($ClusterName)       { $initParams.ClusterName       = $ClusterName }
+        if ($ManagementNetwork) { $initParams.ManagementNetwork = $ManagementNetwork }
+        if ($AksNetwork)        { $initParams.AksNetwork        = $AksNetwork }
+        $Context = Initialize-AksArcValidation @initParams
     }
     if (-not $Region) { $Region = $Context.Region }
 
