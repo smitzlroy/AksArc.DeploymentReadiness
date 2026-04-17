@@ -99,7 +99,7 @@ function Test-DnsName {
 }
 
 function ConvertFrom-AzJson {
-    <# Safely parse JSON text, stripping non-JSON lines (warnings, progress text) #>
+    <# Safely parse JSON text, stripping non-JSON lines and trailing text after JSON #>
     param([object]$RawText)
     if (-not $RawText) { return $null }
     $text = if ($RawText -is [array]) { $RawText -join "`n" } else { [string]$RawText }
@@ -111,7 +111,15 @@ function ConvertFrom-AzJson {
         if ($text[$i] -eq '[' -or $text[$i] -eq '{') { $jsonStart = $i; break }
     }
     if ($jsonStart -lt 0) { return $null }
-    $jsonText = $text.Substring($jsonStart)
+    # Find the last matching ] or } to strip trailing non-JSON text (stderr leaks, warnings)
+    $openChar = $text[$jsonStart]
+    $closeChar = if ($openChar -eq '[') { ']' } else { '}' }
+    $jsonEnd = -1
+    for ($i = $text.Length - 1; $i -ge $jsonStart; $i--) {
+        if ($text[$i] -eq $closeChar) { $jsonEnd = $i; break }
+    }
+    if ($jsonEnd -lt 0) { return $null }
+    $jsonText = $text.Substring($jsonStart, $jsonEnd - $jsonStart + 1)
     try { return ($jsonText | ConvertFrom-Json) } catch { return $null }
 }
 
@@ -120,6 +128,8 @@ function Invoke-AzCliJson {
     .SYNOPSIS
         Run az CLI and return parsed JSON, using System.Diagnostics.Process to bypass
         PS 5.1 native command stderr/stdout redirection bugs.
+        Captures stdout and stderr as SEPARATE streams so stderr warnings never
+        contaminate JSON output.
     #>
     param([string]$Arguments)
     # Resolve full path to az CLI to avoid PATH differences between PowerShell and cmd.exe
@@ -130,17 +140,21 @@ function Invoke-AzCliJson {
     $azExe = if ($script:AzCliPath) { "`"$($script:AzCliPath)`"" } else { 'az' }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'cmd.exe'
-    $psi.Arguments = "/c $azExe $Arguments -o json 2>&1"
+    $psi.Arguments = "/c $azExe $Arguments -o json"
     $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
+        # Read stdout first (large JSON), then stderr (small warnings).
+        # Safe ordering: stderr < 4KB pipe buffer for az CLI warnings.
         $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
         $proc.WaitForExit()
         if ($proc.ExitCode -ne 0) {
-            # Log stderr/error info for diagnostics (first 200 chars)
-            $errSnippet = if ($stdout.Length -gt 200) { $stdout.Substring(0,200) + '...' } else { $stdout }
+            $errMsg = if ($stderr) { $stderr.Trim() } else { $stdout }
+            $errSnippet = if ($errMsg.Length -gt 200) { $errMsg.Substring(0,200) + '...' } else { $errMsg }
             Write-Log "  az $Arguments failed (exit $($proc.ExitCode)): $errSnippet" -Level Warning
             return $null
         }
@@ -155,7 +169,7 @@ function Invoke-AzCliRaw {
     <#
     .SYNOPSIS
         Run az CLI and return raw stdout text (no JSON parsing).
-        Uses System.Diagnostics.Process to bypass PS 5.1 redirection bugs.
+        Uses System.Diagnostics.Process with separate stderr capture.
     #>
     param([string]$Arguments)
     if (-not $script:AzCliPath) {
@@ -165,13 +179,15 @@ function Invoke-AzCliRaw {
     $azExe = if ($script:AzCliPath) { "`"$($script:AzCliPath)`"" } else { 'az' }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'cmd.exe'
-    $psi.Arguments = "/c $azExe $Arguments 2>nul"
+    $psi.Arguments = "/c $azExe $Arguments"
     $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
         $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
         $proc.WaitForExit()
         if ($proc.ExitCode -ne 0) { return $null }
         return $stdout
@@ -1713,9 +1729,9 @@ function Connect-AksArcServicePrincipal {
     if ($UseManagedIdentity) {
         Write-Log 'Authenticating with Managed Identity...' -Level Info
         if ($ManagedIdentityClientId) {
-            az login --identity --username $ManagedIdentityClientId 2>$null
+            Invoke-AzCliRaw "login --identity --username $ManagedIdentityClientId"
         } else {
-            az login --identity 2>$null
+            Invoke-AzCliRaw 'login --identity'
         }
     } else {
         $clientId = if ($ServicePrincipalId) { $ServicePrincipalId } else { $env:AZURE_CLIENT_ID }
@@ -1727,10 +1743,11 @@ function Connect-AksArcServicePrincipal {
         }
 
         Write-Log 'Authenticating with Service Principal...' -Level Info
-        az login --service-principal -u $clientId -p $clientSecret --tenant $tenant 2>$null
+        Invoke-AzCliRaw "login --service-principal -u $clientId -p $clientSecret --tenant $tenant"
     }
 
-    if ($LASTEXITCODE -ne 0) {
+    $acct = Invoke-AzCliJson 'account show'
+    if (-not $acct) {
         Write-Log 'Authentication failed.' -Level Error
         return $false
     }
@@ -1881,6 +1898,13 @@ function Test-AksArcFleetReadiness {
 
     # Collect per-cluster data - parallel when multiple clusters
     $clusterAssessments = @()
+    # Resolve az CLI path for use inside Start-Job (jobs can't access module scope)
+    if (-not $script:AzCliPath) {
+        $azCmd = Get-Command az -ErrorAction SilentlyContinue
+        if ($azCmd) { $script:AzCliPath = $azCmd.Source }
+    }
+    $azPath = if ($script:AzCliPath) { $script:AzCliPath } else { 'az' }
+
     if ($clusters.Count -gt 1 -and $ThrottleLimit -gt 1) {
         Write-Log "Collecting fleet data in parallel (throttle: $ThrottleLimit)..." -Level Info
         $jobs = @()
@@ -1890,27 +1914,28 @@ function Test-AksArcFleetReadiness {
             $clId = if ($cl.id) { $cl.id } else { '' }
             # Start background job for each cluster's supplementary queries
             $jobs += Start-Job -ScriptBlock {
-                param($rg, $sub, $clId)
+                param($rg, $sub, $clId, $azExePath)
                 $result = @{}
+                $azExe = "`"$azExePath`""
 
-                # Use cmd.exe to bypass PS 5.1 native command redirection bugs
-                $arbRaw = & cmd /c "az graph query -q `"resources | where type == 'microsoft.resourcebridge/appliances' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.status, properties.provisioningState`" --subscriptions $sub --first 1 -o json 2>nul"
+                # Use cmd.exe with full az path; stderr redirected to nul at OS level
+                $arbRaw = & cmd /c "$azExe graph query -q `"resources | where type == 'microsoft.resourcebridge/appliances' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.status, properties.provisioningState`" --subscriptions $sub --first 1 -o json 2>nul"
                 $result['arbData'] = if ($arbRaw) { $arbRaw -join "`n" } else { '{"data":[]}' }
 
-                $clRaw = & cmd /c "az graph query -q `"resources | where type == 'microsoft.extendedlocation/customlocations' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState`" --subscriptions $sub --first 1 -o json 2>nul"
+                $clRaw = & cmd /c "$azExe graph query -q `"resources | where type == 'microsoft.extendedlocation/customlocations' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState`" --subscriptions $sub --first 1 -o json 2>nul"
                 $result['clData'] = if ($clRaw) { $clRaw -join "`n" } else { '{"data":[]}' }
 
-                $extRaw = & cmd /c "az graph query -q `"resources | where type == 'microsoft.azurestackhci/clusters/arcextensions' or (type == 'microsoft.kubernetesconfiguration/extensions' and resourceGroup =~ '$rg') | where subscriptionId == '$sub' | project name, type, properties.provisioningState, properties.extensionType`" --subscriptions $sub --first 50 -o json 2>nul"
+                $extRaw = & cmd /c "$azExe graph query -q `"resources | where type == 'microsoft.azurestackhci/clusters/arcextensions' or (type == 'microsoft.kubernetesconfiguration/extensions' and resourceGroup =~ '$rg') | where subscriptionId == '$sub' | project name, type, properties.provisioningState, properties.extensionType`" --subscriptions $sub --first 50 -o json 2>nul"
                 $result['extData'] = if ($extRaw) { $extRaw -join "`n" } else { '{"data":[]}' }
 
-                $lnetRaw = & cmd /c "az graph query -q `"resources | where type == 'microsoft.azurestackhci/logicalnetworks' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState, properties.subnets`" --subscriptions $sub --first 20 -o json 2>nul"
+                $lnetRaw = & cmd /c "$azExe graph query -q `"resources | where type == 'microsoft.azurestackhci/logicalnetworks' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState, properties.subnets`" --subscriptions $sub --first 20 -o json 2>nul"
                 $result['lnetData'] = if ($lnetRaw) { $lnetRaw -join "`n" } else { '{"data":[]}' }
 
-                $aksRaw = & cmd /c "az graph query -q `"resources | where type == 'microsoft.kubernetes/connectedclusters' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState`" --subscriptions $sub --first 50 -o json 2>nul"
+                $aksRaw = & cmd /c "$azExe graph query -q `"resources | where type == 'microsoft.kubernetes/connectedclusters' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.provisioningState`" --subscriptions $sub --first 50 -o json 2>nul"
                 $result['aksData'] = if ($aksRaw) { $aksRaw -join "`n" } else { '{"data":[]}' }
 
                 return $result
-            } -ArgumentList $rg, $sub, $clId
+            } -ArgumentList $rg, $sub, $clId, $azPath
             # Throttle - wait if too many jobs running
             while (@($jobs | Where-Object { $_.State -eq 'Running' }).Count -ge $ThrottleLimit) {
                 $completed = $jobs | Where-Object { $_.State -eq 'Completed' } | Select-Object -First 1
@@ -2152,8 +2177,10 @@ function Get-AksArcFleetProgress {
     $subParam = ''
     if ($SubscriptionId) { $subParam = "--subscriptions $SubscriptionId" }
 
-    $rgExt = az extension show --name resource-graph 2>$null
-    if (-not $rgExt) { az extension add --name resource-graph --yes 2>$null }
+    $rgExt = Invoke-AzCliJson 'extension show --name resource-graph'
+    if (-not $rgExt) {
+        Invoke-AzCliRaw 'extension add --name resource-graph --yes'
+    }
 
     $graphResult = Invoke-AzCliJson "graph query -q `"$query`" $subParam --first 500"
     $data = if ($graphResult -and $graphResult.data) { $graphResult.data } else { @() }
