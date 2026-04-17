@@ -140,7 +140,11 @@ function Invoke-AzCliJson {
     $azExe = if ($script:AzCliPath) { "`"$($script:AzCliPath)`"" } else { 'az' }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'cmd.exe'
-    $psi.Arguments = "/c $azExe $Arguments -o json"
+    # /d = skip AutoRun, /s = preserve outer quotes verbatim, /c = run and exit.
+    # Outer double-quotes are REQUIRED when $azExe contains spaces or parens
+    # (e.g. 'C:\Program Files (x86)\...\az.cmd'); without them cmd.exe strips
+    # the first+last inner quotes and mangles the path.
+    $psi.Arguments = "/d /s /c `"$azExe $Arguments -o json`""
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
@@ -154,12 +158,17 @@ function Invoke-AzCliJson {
         $proc.WaitForExit()
         if ($proc.ExitCode -ne 0) {
             $errMsg = if ($stderr) { $stderr.Trim() } else { $stdout }
-            $errSnippet = if ($errMsg.Length -gt 200) { $errMsg.Substring(0,200) + '...' } else { $errMsg }
+            # Preserve the full last error for callers that want to distinguish
+            # auth failures from transient / config errors.
+            $script:LastAzCliError = $errMsg
+            $errSnippet = if ($errMsg.Length -gt 300) { $errMsg.Substring(0,300) + '...' } else { $errMsg }
             Write-Log "  az $Arguments failed (exit $($proc.ExitCode)): $errSnippet" -Level Warning
             return $null
         }
+        $script:LastAzCliError = $null
         return (ConvertFrom-AzJson $stdout)
     } catch {
+        $script:LastAzCliError = $_.Exception.Message
         Write-Log "  Invoke-AzCliJson exception: $($_.Exception.Message)" -Level Warning
         return $null
     }
@@ -179,7 +188,8 @@ function Invoke-AzCliRaw {
     $azExe = if ($script:AzCliPath) { "`"$($script:AzCliPath)`"" } else { 'az' }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'cmd.exe'
-    $psi.Arguments = "/c $azExe $Arguments"
+    # See Invoke-AzCliJson for explanation of the /d /s /c + outer-quote pattern.
+    $psi.Arguments = "/d /s /c `"$azExe $Arguments`""
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
@@ -189,9 +199,14 @@ function Invoke-AzCliRaw {
         $stdout = $proc.StandardOutput.ReadToEnd()
         $stderr = $proc.StandardError.ReadToEnd()
         $proc.WaitForExit()
-        if ($proc.ExitCode -ne 0) { return $null }
+        if ($proc.ExitCode -ne 0) {
+            $script:LastAzCliError = if ($stderr) { $stderr.Trim() } else { $stdout }
+            return $null
+        }
+        $script:LastAzCliError = $null
         return $stdout
     } catch {
+        $script:LastAzCliError = $_.Exception.Message
         return $null
     }
 }
@@ -491,9 +506,31 @@ function Initialize-AksArcValidation {
     #   1) -ClusterName + -ResourceGroupName provided       -> direct `az resource show`
     #   2) Running on an Azure Local node                   -> auto-detect + direct `az resource show`
     #   3) Management workstation (no node, no params)      -> subscription-wide list
+    #
+    # If paths 1 or 2 succeed in identifying the cluster but the ARM read itself fails
+    # (typically AuthorizationFailed), we DO NOT throw. The cluster identity is known,
+    # so we synthesize a minimal cluster object from local/azcmagent data and record the
+    # RBAC shortfall as an initialization diagnostic. Subsequent gates will either
+    # surface the RBAC problem as a proper Failed result or degrade gracefully.
     Write-Log '[Step 4/6] Resolving target Azure Local cluster...' -Level Info
     $cluster = $null
     $resolveMode = $null
+    $localCtx = $null
+    $initDiagnostics = @()
+
+    # Helper: turn a known (name, RG, sub, location) tuple into a cluster-shaped object
+    # that downstream code can use even when ARM reads are blocked.
+    $synthCluster = {
+        param($name, $rg, $subId, $loc)
+        [PSCustomObject]@{
+            name          = $name
+            resourceGroup = $rg
+            location      = $loc
+            id            = "/subscriptions/$subId/resourceGroups/$rg/providers/Microsoft.AzureStackHCI/clusters/$name"
+            properties    = $null
+            _synthesized  = $true
+        }
+    }
 
     # --- Path 1: explicit parameters --------------------------------------------------
     if ($ClusterName -and $ResourceGroupName) {
@@ -502,32 +539,50 @@ function Initialize-AksArcValidation {
         $clusterUri = "/subscriptions/$($account.id)/resourceGroups/$ResourceGroupName/providers/Microsoft.AzureStackHCI/clusters/$ClusterName"
         $cluster = Invoke-AzCliJson "resource show --ids `"$clusterUri`""
         if (-not $cluster) {
-            throw "Cluster '$ClusterName' not found in resource group '$ResourceGroupName' (subscription $($account.id)). Verify the name, the az CLI has 'Reader' on the cluster, and that the subscription context is correct."
+            $err = $script:LastAzCliError
+            if ($err -match 'AuthorizationFailed|does not have authorization') {
+                Write-Log "  ARM read blocked by RBAC. Continuing with local identity only." -Level Warning
+                $initDiagnostics += "ARM read on cluster '$ClusterName' blocked by RBAC: $($err -replace '\s+',' ' | ForEach-Object { if ($_.Length -gt 400) { $_.Substring(0,400) + '...' } else { $_ } })"
+                $cluster = & $synthCluster $ClusterName $ResourceGroupName $account.id $null
+                $resolveMode = 'Explicit-NoARM'
+            } else {
+                throw "Cluster '$ClusterName' not found in resource group '$ResourceGroupName' (subscription $($account.id)). $err"
+            }
         }
     }
 
     # --- Path 2: running on an Azure Local node --------------------------------------
     if (-not $cluster) {
-        $local = Get-AksArcLocalContext
-        if ($local -and $local.IsAzureLocalNode) {
+        $localCtx = Get-AksArcLocalContext
+        if ($localCtx -and $localCtx.IsAzureLocalNode) {
             $resolveMode = 'AzureLocalNode'
-            Write-Log "  Detected Azure Local node '$($local.NodeName)' - cluster '$($local.ClusterName)' in RG '$($local.ResourceGroupName)' (sub $($local.SubscriptionId))." -Level Success
+            Write-Log "  Detected Azure Local node '$($localCtx.NodeName)' - cluster '$($localCtx.ClusterName)' in RG '$($localCtx.ResourceGroupName)' (sub $($localCtx.SubscriptionId))." -Level Success
 
             # If node's subscription differs from current az context, switch context.
-            if ($local.SubscriptionId -and $account.id -ne $local.SubscriptionId) {
-                Write-Log "  Switching az context to node's subscription: $($local.SubscriptionId)" -Level Info
-                Invoke-AzCliRaw "account set -s $($local.SubscriptionId)" | Out-Null
+            if ($localCtx.SubscriptionId -and $account.id -ne $localCtx.SubscriptionId) {
+                Write-Log "  Switching az context to node's subscription: $($localCtx.SubscriptionId)" -Level Info
+                Invoke-AzCliRaw "account set -s $($localCtx.SubscriptionId)" | Out-Null
                 $account = Invoke-AzCliJson 'account show'
             }
 
             # Honor a caller override on just one of the two values.
-            if (-not $ClusterName)       { $ClusterName       = $local.ClusterName }
-            if (-not $ResourceGroupName) { $ResourceGroupName = $local.ResourceGroupName }
+            if (-not $ClusterName)       { $ClusterName       = $localCtx.ClusterName }
+            if (-not $ResourceGroupName) { $ResourceGroupName = $localCtx.ResourceGroupName }
 
             $clusterUri = "/subscriptions/$($account.id)/resourceGroups/$ResourceGroupName/providers/Microsoft.AzureStackHCI/clusters/$ClusterName"
             $cluster = Invoke-AzCliJson "resource show --ids `"$clusterUri`""
             if (-not $cluster) {
-                Write-Log "  Direct lookup failed for '$ClusterName' in '$ResourceGroupName'. The node identity may lack 'Reader' on the cluster resource, or the HCI cluster resource name differs from the failover cluster name." -Level Warning
+                $err = $script:LastAzCliError
+                if ($err -match 'AuthorizationFailed|does not have authorization') {
+                    Write-Log "  ARM read on cluster blocked by RBAC. Continuing with node-local identity; Gate RBAC will record this." -Level Warning
+                    $initDiagnostics += "ARM read on cluster '$ClusterName' blocked by RBAC. The identity signed in to az CLI lacks 'Microsoft.AzureStackHCI/clusters/read' on the cluster RG. Grant the deploying identity at least 'Reader' on '/subscriptions/$($account.id)/resourceGroups/$ResourceGroupName' (Azure Stack HCI Device Management Role for deployment)."
+                } else {
+                    Write-Log "  Direct lookup failed for '$ClusterName' in '$ResourceGroupName' (reason: $($err -replace '\s+',' '))." -Level Warning
+                    $initDiagnostics += "ARM read on cluster '$ClusterName' failed: $err"
+                }
+                # Synthesize from local data so gates can still run.
+                $cluster = & $synthCluster $ClusterName $ResourceGroupName $account.id $localCtx.Location
+                $resolveMode = 'AzureLocalNode-NoARM'
             }
         }
     }
@@ -586,11 +641,20 @@ function Initialize-AksArcValidation {
     # Discover ARB
     Write-Log '  Checking Arc Resource Bridge...' -Level Info
     $arbs = Invoke-AzCliJson "arcappliance list -g $rg"
-    if (-not $arbs) { $arbs = @() } else { $arbs = @($arbs) }
+    $arbReadBlocked = $false
+    if (-not $arbs) {
+        if ($script:LastAzCliError -and $script:LastAzCliError -match 'AuthorizationFailed|does not have authorization') {
+            $arbReadBlocked = $true
+            $initDiagnostics += "ARM read on Arc Resource Bridge blocked by RBAC (arcappliance list -g $rg)."
+        }
+        $arbs = @()
+    } else { $arbs = @($arbs) }
     $arb = $arbs | Select-Object -First 1
 
     if ($arb) {
         Write-Log "ARB: $($arb.name) (status: $($arb.status))" -Level Success
+    } elseif ($arbReadBlocked) {
+        Write-Log 'ARB read blocked by RBAC - cannot determine presence.' -Level Warning
     } else {
         Write-Log 'No Arc Resource Bridge found.' -Level Warning
     }
@@ -598,11 +662,20 @@ function Initialize-AksArcValidation {
     # Discover Custom Location
     Write-Log '  Checking Custom Location...' -Level Info
     $customLocations = Invoke-AzCliJson "customlocation list -g $rg"
-    if (-not $customLocations) { $customLocations = @() } else { $customLocations = @($customLocations) }
+    $clReadBlocked = $false
+    if (-not $customLocations) {
+        if ($script:LastAzCliError -and $script:LastAzCliError -match 'AuthorizationFailed|does not have authorization') {
+            $clReadBlocked = $true
+            $initDiagnostics += "ARM read on Custom Location blocked by RBAC (customlocation list -g $rg)."
+        }
+        $customLocations = @()
+    } else { $customLocations = @($customLocations) }
     $customLoc = $customLocations | Select-Object -First 1
 
     if ($customLoc) {
         Write-Log "Custom Location: $($customLoc.name)" -Level Success
+    } elseif ($clReadBlocked) {
+        Write-Log 'Custom Location read blocked by RBAC.' -Level Warning
     } else {
         Write-Log 'No Custom Location found.' -Level Warning
     }
@@ -704,6 +777,8 @@ function Initialize-AksArcValidation {
         ClusterIP          = $ClusterIP
         HostType           = $hostType
         ResolveMode        = $resolveMode
+        InitDiagnostics    = $initDiagnostics
+        AzureReadable      = -not [bool]($cluster.PSObject.Properties.Name -contains '_synthesized' -and $cluster._synthesized)
         Timestamp          = (Get-Date -Format 'o')
     }
 
@@ -1145,6 +1220,87 @@ function Test-AksArcDeploymentReadiness {
 
     if ($PSCmdlet.ShouldProcess($Context.ClusterName, 'Run deployment readiness gates')) {
 
+        # Gate 0: Prerequisites & RBAC - surface issues discovered during Initialize as
+        # first-class findings so they show up in the report even when other gates skip.
+        Write-Log '' -Level Info
+        Write-Log 'Gate 0: Prerequisites & RBAC' -Level Header
+        if ($Context.PSObject.Properties.Name -contains 'InitDiagnostics' -and $Context.InitDiagnostics -and $Context.InitDiagnostics.Count -gt 0) {
+            foreach ($diag in $Context.InitDiagnostics) {
+                $results += New-ValidationResult -Gate 'Prerequisites' -Check 'AzureRBAC' -Status 'Failed' `
+                    -Message 'Azure RBAC is insufficient for AKS Arc deployment validation' `
+                    -Detail $diag `
+                    -Remediation "The identity signed in to az CLI on this node must have at least 'Reader' on the cluster resource group, plus 'Azure Stack HCI Administrator' (or equivalent) on the cluster. For deployment, grant 'Azure Stack HCI Device Management Role' and 'Azure Connected Machine Resource Administrator' on the RG. See https://learn.microsoft.com/azure/aks/aksarc/aks-edge-deployment-identity"
+                Write-Log "  [FAIL] $diag" -Level Error
+            }
+        } else {
+            $results += New-ValidationResult -Gate 'Prerequisites' -Check 'AzureRBAC' -Status 'Passed' -Message "Initialize completed without RBAC errors (ResolveMode: $($Context.ResolveMode))"
+            Write-Log "  ARM reads succeeded during initialization (ResolveMode: $($Context.ResolveMode))." -Level Success
+        }
+
+        # Local node cluster health - independent of Azure RBAC. Always run when the
+        # failover clustering feature is available.
+        if (Get-Command Get-Cluster -ErrorAction SilentlyContinue) {
+            try {
+                $fc = Get-Cluster -ErrorAction Stop
+                $nodes = @(Get-ClusterNode -ErrorAction SilentlyContinue)
+                $upNodes = @($nodes | Where-Object { $_.State -eq 'Up' })
+                $nodeSummary = "$($upNodes.Count)/$($nodes.Count) nodes Up"
+                if ($nodes.Count -gt 0 -and $upNodes.Count -eq $nodes.Count) {
+                    $results += New-ValidationResult -Gate 'Prerequisites' -Check 'FailoverClusterHealth' -Status 'Passed' `
+                        -Message "Failover cluster '$($fc.Name)' healthy ($nodeSummary)"
+                    Write-Log "  Failover cluster '$($fc.Name)' healthy: $nodeSummary" -Level Success
+                } elseif ($nodes.Count -gt 0) {
+                    $downNodes = @($nodes | Where-Object { $_.State -ne 'Up' }) | ForEach-Object { "$($_.Name)=$($_.State)" }
+                    $results += New-ValidationResult -Gate 'Prerequisites' -Check 'FailoverClusterHealth' -Status 'Failed' `
+                        -Message "Failover cluster '$($fc.Name)' has unhealthy nodes ($nodeSummary)" `
+                        -Detail ($downNodes -join ', ') `
+                        -Remediation 'All cluster nodes must be Up before deploying AKS Arc. Investigate downed nodes via Get-ClusterNode and failover cluster manager.'
+                    Write-Log "  Failover cluster '$($fc.Name)' UNHEALTHY: $nodeSummary ($($downNodes -join ', '))" -Level Error
+                } else {
+                    $results += New-ValidationResult -Gate 'Prerequisites' -Check 'FailoverClusterHealth' -Status 'Warning' `
+                        -Message "Failover cluster '$($fc.Name)' found but Get-ClusterNode returned no nodes" `
+                        -Remediation 'Run Get-ClusterNode manually to diagnose.'
+                }
+            } catch {
+                $results += New-ValidationResult -Gate 'Prerequisites' -Check 'FailoverClusterHealth' -Status 'Skipped' `
+                    -Message 'Get-Cluster failed on this host' -Detail $_.Exception.Message
+            }
+        } else {
+            $results += New-ValidationResult -Gate 'Prerequisites' -Check 'FailoverClusterHealth' -Status 'Skipped' `
+                -Message 'Failover Clustering cmdlets not available - not running on an Azure Local node'
+        }
+
+        # Arc agent health - independent of Azure RBAC.
+        $agentExe = Get-Command azcmagent -ErrorAction SilentlyContinue
+        if (-not $agentExe) {
+            foreach ($p in @("$env:ProgramFiles\AzureConnectedMachineAgent\azcmagent.exe","$env:ProgramW6432\AzureConnectedMachineAgent\azcmagent.exe")) {
+                if ($p -and (Test-Path $p)) { $agentExe = Get-Command $p -ErrorAction SilentlyContinue; break }
+            }
+        }
+        if ($agentExe) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $agentExe.Source
+            $psi.Arguments = 'show -j'
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError  = $true
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow  = $true
+            try {
+                $p = [System.Diagnostics.Process]::Start($psi)
+                $out = $p.StandardOutput.ReadToEnd(); $null = $p.StandardError.ReadToEnd(); $p.WaitForExit()
+                $agent = ConvertFrom-AzJson $out
+                if ($agent -and $agent.status -eq 'Connected') {
+                    $results += New-ValidationResult -Gate 'Prerequisites' -Check 'ArcAgentStatus' -Status 'Passed' `
+                        -Message "Arc agent Connected (version $($agent.agentVersion))"
+                    Write-Log "  Arc agent Connected (version $($agent.agentVersion))." -Level Success
+                } elseif ($agent) {
+                    $results += New-ValidationResult -Gate 'Prerequisites' -Check 'ArcAgentStatus' -Status 'Failed' `
+                        -Message "Arc agent status: $($agent.status)" `
+                        -Remediation 'The Arc agent must be Connected for AKS Arc deployment. Run: azcmagent connect ... or check network egress to *.his.arc.azure.com.'
+                }
+            } catch { }
+        }
+
         # Gate 1: Azure Local Cluster Health
         Write-Log '' -Level Info
         Write-Log 'Gate 1: Azure Local Cluster Health' -Level Header
@@ -1176,9 +1332,16 @@ function Test-AksArcDeploymentReadiness {
                 }
             }
         } else {
-            $results += New-ValidationResult -Gate 'ClusterHealth' -Check 'ClusterReachable' -Status 'Failed' `
-                -Message 'Cannot query cluster via ARM API' `
-                -Remediation 'Verify az CLI login and subscription context.'
+            # If Azure was unreadable during Initialize, don't double-report - Gate 0 already captured it.
+            if ($Context.AzureReadable -ne $false) {
+                $results += New-ValidationResult -Gate 'ClusterHealth' -Check 'ClusterReachable' -Status 'Failed' `
+                    -Message 'Cannot query cluster via ARM API' `
+                    -Remediation 'Verify az CLI login and subscription context.'
+            } else {
+                $results += New-ValidationResult -Gate 'ClusterHealth' -Check 'ClusterReachable' -Status 'Skipped' `
+                    -Message 'Skipped - Azure ARM reads blocked by RBAC (see Gate 0 Prerequisites)'
+                Write-Log '  Gate 1 skipped - ARM reads blocked. See Gate 0 findings.' -Level Warning
+            }
         }
 
         # Gate 2: ARB Health
@@ -2113,7 +2276,10 @@ function Test-AksArcFleetReadiness {
                 $result = @{}
                 $azExe = "`"$azExePath`""
 
-                # Use cmd.exe with full az path; stderr redirected to nul at OS level
+                # NOTE: these parallel Graph queries still use the legacy cmd /c pattern
+                # and may fail when $azExe contains parens (e.g. Program Files (x86)).
+                # The single-site code path (Invoke-AzCliJson) uses the fixed /d /s /c
+                # pattern. A future refactor should move these to ProcessStartInfo.
                 $arbRaw = & cmd /c "$azExe graph query -q `"resources | where type == 'microsoft.resourcebridge/appliances' | where resourceGroup =~ '$rg' | where subscriptionId == '$sub' | project name, properties.status, properties.provisioningState`" --subscriptions $sub --first 1 -o json 2>nul"
                 $result['arbData'] = if ($arbRaw) { $arbRaw -join "`n" } else { '{"data":[]}' }
 
