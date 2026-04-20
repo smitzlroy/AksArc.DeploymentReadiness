@@ -245,6 +245,16 @@ function Get-AksArcLocalContext {
         Location          = $null
         NodeName          = $env:COMPUTERNAME
         Source            = $null
+        # Arc Gateway / proxy info from `azcmagent show -j`. Customers using Arc
+        # Gateway only need ~7 outbound endpoints; the rest are tunneled. We surface
+        # this so the connectivity gate can skip endpoints covered by the gateway
+        # instead of falsely reporting them unreachable.
+        ArcGatewayEnabled = $false
+        ArcGatewayUrl     = $null
+        ConnectionType    = $null   # 'direct' | 'gateway' | 'private'
+        UpstreamProxy     = $null
+        AgentVersion      = $null
+        AgentStatus       = $null
     }
 
     # 1. Failover cluster name (local, no network call).
@@ -311,6 +321,54 @@ function Get-AksArcLocalContext {
     $result.ClusterName       = $clusterName
     $result.Location          = $location
     $result.Source            = 'AzureLocalNode(Get-Cluster+azcmagent)'
+    $result.AgentVersion      = $agent.agentVersion
+    $result.AgentStatus       = $agent.status
+    $result.UpstreamProxy     = $agent.upstreamProxy
+
+    # Arc Gateway detection. azcmagent JSON varies by agent version - check several
+    # likely field names. The gateway URL ends in '.gw.arc.azure.com'.
+    $gwUrl = $null
+    foreach ($f in @('gatewayUrl','arcGatewayUrl','azureArcGatewayUrl')) {
+        if ($agent.PSObject.Properties.Name -contains $f -and $agent.$f) { $gwUrl = [string]$agent.$f; break }
+    }
+    # Some versions nest gateway info under a 'gateway' object.
+    if (-not $gwUrl -and $agent.PSObject.Properties.Name -contains 'gateway' -and $agent.gateway) {
+        foreach ($f in @('url','endpoint','uri')) {
+            if ($agent.gateway.PSObject.Properties.Name -contains $f -and $agent.gateway.$f) { $gwUrl = [string]$agent.gateway.$f; break }
+        }
+    }
+    # Connection type field (1.51+ exposes this).
+    $connType = $null
+    foreach ($f in @('connectionType','connection.type','connection')) {
+        if ($agent.PSObject.Properties.Name -contains $f -and $agent.$f) { $connType = [string]$agent.$f; break }
+    }
+    # Fall back to `azcmagent config get connection.type` for older agents.
+    if (-not $connType) {
+        $cfgPsi = New-Object System.Diagnostics.ProcessStartInfo
+        $cfgPsi.FileName = $azcmExe
+        $cfgPsi.Arguments = 'config get connection.type'
+        $cfgPsi.RedirectStandardOutput = $true
+        $cfgPsi.RedirectStandardError  = $true
+        $cfgPsi.UseShellExecute = $false
+        $cfgPsi.CreateNoWindow  = $true
+        try {
+            $cp = [System.Diagnostics.Process]::Start($cfgPsi)
+            $cout = $cp.StandardOutput.ReadToEnd(); $null = $cp.StandardError.ReadToEnd(); $cp.WaitForExit()
+            if ($cp.ExitCode -eq 0 -and $cout) {
+                # Output is plain text like 'gateway' or a single-line.
+                $cval = ($cout.Trim() -split "`n")[-1].Trim()
+                if ($cval) { $connType = $cval }
+            }
+        } catch {}
+    }
+    if ($gwUrl) {
+        $result.ArcGatewayUrl     = $gwUrl -replace '^https?://',''
+        $result.ArcGatewayEnabled = $true
+    }
+    if ($connType) {
+        $result.ConnectionType = $connType
+        if ($connType -match 'gateway') { $result.ArcGatewayEnabled = $true }
+    }
     return $result
 }
 
@@ -453,7 +511,13 @@ function Initialize-AksArcValidation {
         [string]$AksNetwork,
         [string[]]$ManagementIPs,
         [string]$AksSubnetTestIP,
-        [string]$ClusterIP
+        [string]$ClusterIP,
+        # Customer-specific endpoint substitutions. When set, the connectivity gate
+        # tests the real URL instead of skipping the '<your-...>' placeholder.
+        # ArcGatewayUrl is auto-detected from azcmagent show -j when running on a node;
+        # this parameter is the override for management-workstation use.
+        [string]$ArcGatewayUrl,
+        [string]$KeyVaultName
     )
 
     Write-Log '========================================' -Level Header
@@ -779,7 +843,23 @@ function Initialize-AksArcValidation {
         ResolveMode        = $resolveMode
         InitDiagnostics    = $initDiagnostics
         AzureReadable      = -not [bool]($cluster.PSObject.Properties.Name -contains '_synthesized' -and $cluster._synthesized)
+        # Arc Gateway / proxy info pulled from azcmagent show -j (when available).
+        ArcGatewayEnabled  = if ($ArcGatewayUrl) { $true } elseif ($localCtx) { [bool]$localCtx.ArcGatewayEnabled } else { $false }
+        ArcGatewayUrl      = if ($ArcGatewayUrl) { $ArcGatewayUrl -replace '^https?://','' } elseif ($localCtx) { $localCtx.ArcGatewayUrl } else { $null }
+        ConnectionType     = if ($localCtx) { $localCtx.ConnectionType } else { $null }
+        UpstreamProxy      = if ($localCtx) { $localCtx.UpstreamProxy } else { $null }
+        # Customer-specific endpoints. Populated via parameters on Initialize/Test or
+        # left $null (the connectivity gate will skip the placeholder rather than
+        # falsely failing 'manual validation required').
+        KeyVaultName       = $KeyVaultName
         Timestamp          = (Get-Date -Format 'o')
+    }
+
+    if ($ctx.ArcGatewayEnabled) {
+        Write-Log "Arc Gateway detected: $($ctx.ArcGatewayUrl) (connection.type=$($ctx.ConnectionType)). Endpoints covered by the gateway will be skipped during connectivity testing." -Level Success
+    }
+    if ($ctx.KeyVaultName) {
+        Write-Log "Key Vault override: $($ctx.KeyVaultName).vault.azure.net will be tested." -Level Info
     }
 
     Write-Log 'Initialization complete.' -Level Success
@@ -828,7 +908,15 @@ function Test-AksArcNetworkConnectivity {
         [string]$Region,
         [int]$TimeoutMs = 5000,
         [switch]$PassThru,
-        [string]$ExportPath
+        [string]$ExportPath,
+        # When the customer uses Arc Gateway, all endpoints with arcGatewaySupported=true
+        # are tunneled and don't need direct firewall rules. Pass the gateway URL to:
+        #   * substitute the actual hostname for the '<your-arc-gateway-id>.gw.arc.azure.com' placeholder
+        #   * mark gateway-covered endpoints as 'CoveredByArcGateway' instead of testing them directly
+        [string]$ArcGatewayUrl,
+        # Customer Key Vault for HSM/secret integration. When set, replaces the
+        # '<your-keyvault-name>.vault.azure.net' placeholder with the real hostname.
+        [string]$KeyVaultName
     )
 
     Write-Log '========================================' -Level Header
@@ -861,6 +949,35 @@ function Test-AksArcNetworkConnectivity {
 
     foreach ($ep in $endpoints) {
         $url = $ep.url
+        # --- Customer-specific placeholder substitution -----------------------------
+        # endpoints.json uses '<your-...>' tokens for endpoints whose hostname depends
+        # on the customer's deployment. Replace them with real values when known.
+        $isPlaceholder = $false
+        if ($url -match '<your-arc-gateway-id>') {
+            if ($ArcGatewayUrl) {
+                $url = $url -replace '<your-arc-gateway-id>\.gw\.arc\.azure\.com', ($ArcGatewayUrl -replace '^https?://','')
+            } else {
+                $isPlaceholder = $true
+            }
+        } elseif ($url -match '<your-keyvault-name>') {
+            if ($KeyVaultName) {
+                $url = $url -replace '<your-keyvault-name>', $KeyVaultName
+            } else {
+                $isPlaceholder = $true
+            }
+        } elseif ($url -match '<.*>') {
+            $isPlaceholder = $true
+        }
+
+        # --- Arc Gateway short-circuit ---------------------------------------------
+        # When Arc Gateway is enabled, endpoints flagged arcGatewaySupported=true do
+        # not need direct outbound rules. We test the gateway URL itself separately
+        # (see below) and mark the underlying endpoints as covered.
+        $gatewayCovered = $false
+        if ($ArcGatewayUrl -and $ep.arcGatewaySupported -eq $true -and $url -notmatch 'gw\.arc\.azure\.com') {
+            $gatewayCovered = $true
+        }
+
         # Resolve region-specific URLs (replace region prefix for explicit region endpoints)
         if ($Region -and $ep.regionSpecific) {
             foreach ($pattern in $data.regionUrlPatterns) {
@@ -879,7 +996,20 @@ function Test-AksArcNetworkConnectivity {
         $detail = ''
         $latency = -1
 
-        switch ($method) {
+        if ($gatewayCovered) {
+            $status = 'Skipped'
+            $detail = "Covered by Arc Gateway ($ArcGatewayUrl)"
+        } elseif ($isPlaceholder) {
+            $status = 'Skipped'
+            $detail = if ($ep.url -match '<your-arc-gateway-id>') {
+                'Arc Gateway not configured (pass -ArcGatewayUrl if your environment uses one)'
+            } elseif ($ep.url -match '<your-keyvault-name>') {
+                'Key Vault not specified (pass -KeyVaultName to test)'
+            } else {
+                'Customer-specific endpoint - manual validation required'
+            }
+        } else {
+            switch ($method) {
             'tcp_connect' {
                 $tcp = Test-TcpPort -Hostname $testHost -Port $ep.port -TimeoutMs $TimeoutMs
                 if ($tcp.Connected) {
@@ -914,6 +1044,7 @@ function Test-AksArcNetworkConnectivity {
                 $detail = 'Manual validation required'
             }
         }
+        }  # end else { switch ($method) ... }
 
         $icon = switch ($status) {
             'Passed'  { '[PASS]' }
@@ -1195,6 +1326,8 @@ function Test-AksArcDeploymentReadiness {
         [string]$ClusterName,
         [string]$ManagementNetwork,
         [string]$AksNetwork,
+        [string]$ArcGatewayUrl,
+        [string]$KeyVaultName,
         [switch]$SkipNetworkTests,
         [switch]$PassThru,
         [string]$ExportPath,
@@ -1212,8 +1345,13 @@ function Test-AksArcDeploymentReadiness {
         if ($ClusterName)       { $initParams.ClusterName       = $ClusterName }
         if ($ManagementNetwork) { $initParams.ManagementNetwork = $ManagementNetwork }
         if ($AksNetwork)        { $initParams.AksNetwork        = $AksNetwork }
+        if ($ArcGatewayUrl)     { $initParams.ArcGatewayUrl     = $ArcGatewayUrl }
+        if ($KeyVaultName)      { $initParams.KeyVaultName      = $KeyVaultName }
         $Context = Initialize-AksArcValidation @initParams
     }
+    # Allow overrides at Test- time even when -Context was passed in.
+    if ($ArcGatewayUrl -and -not $Context.ArcGatewayUrl) { $Context | Add-Member -NotePropertyName ArcGatewayUrl -NotePropertyValue $ArcGatewayUrl -Force }
+    if ($KeyVaultName  -and -not $Context.KeyVaultName)  { $Context | Add-Member -NotePropertyName KeyVaultName  -NotePropertyValue $KeyVaultName  -Force }
     if (-not $Region) { $Region = $Context.Region }
 
     $results = @()
@@ -1299,6 +1437,20 @@ function Test-AksArcDeploymentReadiness {
                         -Remediation 'The Arc agent must be Connected for AKS Arc deployment. Run: azcmagent connect ... or check network egress to *.his.arc.azure.com.'
                 }
             } catch { }
+        }
+
+        # Arc Gateway / connection-mode awareness. This is informational - both
+        # 'gateway' and 'direct' are valid; we record which is in use so the
+        # connectivity gate behavior makes sense in the report.
+        if ($Context.ArcGatewayEnabled -and $Context.ArcGatewayUrl) {
+            $results += New-ValidationResult -Gate 'Prerequisites' -Check 'ArcGateway' -Status 'Passed' `
+                -Message "Arc Gateway in use: $($Context.ArcGatewayUrl)" `
+                -Detail "connection.type=$($Context.ConnectionType). Endpoints with arcGatewaySupported=true will be tunneled and skipped during direct connectivity testing."
+            Write-Log "  Arc Gateway: $($Context.ArcGatewayUrl) (connection.type=$($Context.ConnectionType))" -Level Success
+        } else {
+            $results += New-ValidationResult -Gate 'Prerequisites' -Check 'ArcGateway' -Status 'Skipped' `
+                -Message 'Arc Gateway not configured (direct outbound mode)' `
+                -Detail 'All ~86 endpoints will be tested individually. If your environment uses Arc Gateway, pass -ArcGatewayUrl <prefix>.gw.arc.azure.com or run azcmagent show on a node to verify.'
         }
 
         # Gate 1: Azure Local Cluster Health
@@ -1400,17 +1552,25 @@ function Test-AksArcDeploymentReadiness {
             $results += New-ValidationResult -Gate 'NetworkConnectivity' -Check 'EndpointReachability' -Status 'Skipped' -Message 'Network tests skipped via -SkipNetworkTests'
             Write-Log '  Skipped (use -SkipNetworkTests:$false to enable)' -Level Warning
         } else {
-            $netResults = Test-AksArcNetworkConnectivity -Region $Region -PassThru
+            $netParams = @{ Region = $Region; PassThru = $true }
+            if ($Context.ArcGatewayUrl) { $netParams.ArcGatewayUrl = $Context.ArcGatewayUrl }
+            if ($Context.KeyVaultName)  { $netParams.KeyVaultName  = $Context.KeyVaultName }
+            $netResults = Test-AksArcNetworkConnectivity @netParams
             $netFailed = @($netResults | Where-Object { $_.Status -eq 'Failed' })
+            $netSkipped = @($netResults | Where-Object { $_.Status -eq 'Skipped' })
+            $netGwSkipped = @($netResults | Where-Object { $_.Detail -like 'Covered by Arc Gateway*' })
             if ($netFailed.Count -eq 0) {
-                $results += New-ValidationResult -Gate 'NetworkConnectivity' -Check 'EndpointReachability' -Status 'Passed' `
-                    -Message "All $($netResults.Count) endpoints reachable"
+                $msg = "All testable endpoints reachable ($($netResults.Count) total"
+                if ($netGwSkipped.Count -gt 0) { $msg += ", $($netGwSkipped.Count) covered by Arc Gateway" }
+                if ($netSkipped.Count -gt $netGwSkipped.Count) { $msg += ", $($netSkipped.Count - $netGwSkipped.Count) skipped" }
+                $msg += ')'
+                $results += New-ValidationResult -Gate 'NetworkConnectivity' -Check 'EndpointReachability' -Status 'Passed' -Message $msg
             } else {
                 $failedUrls = ($netFailed | Select-Object -First 5 | ForEach-Object { "$($_.Url):$($_.Port)" }) -join ', '
                 $results += New-ValidationResult -Gate 'NetworkConnectivity' -Check 'EndpointReachability' -Status 'Failed' `
                     -Message "$($netFailed.Count) of $($netResults.Count) endpoints unreachable" `
                     -Detail "Failed: $failedUrls$(if ($netFailed.Count -gt 5) { '...' })" `
-                    -Remediation 'Open firewall rules for failed endpoints. Run Get-AksArcEndpointReference for full list.'
+                    -Remediation 'Open firewall rules for failed endpoints. Run Get-AksArcEndpointReference for full list. If your environment uses Arc Gateway, pass -ArcGatewayUrl to skip endpoints tunneled by the gateway.'
             }
         }
 

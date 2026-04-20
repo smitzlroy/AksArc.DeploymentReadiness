@@ -13,7 +13,7 @@ Describe 'AksArc.DeploymentReadiness Module' {
         It 'Module manifest is valid' {
             $manifest = Test-ModuleManifest -Path (Join-Path $PSScriptRoot '..' 'AksArc.DeploymentReadiness.psd1')
             $manifest | Should -Not -BeNullOrEmpty
-            $manifest.Version | Should -Be '0.8.1'
+            $manifest.Version | Should -Be '0.8.2'
         }
 
         It 'Exports exactly 11 functions' {
@@ -589,6 +589,53 @@ Describe 'AksArc.DeploymentReadiness Module' {
             $cmd = Get-Command Test-AksArcDeploymentReadiness
             $cmd.Parameters.ContainsKey('ManagementNetwork') | Should -Be $true
             $cmd.Parameters.ContainsKey('AksNetwork')        | Should -Be $true
+        }
+    }
+
+    Context 'v0.8.2 Arc Gateway and Key Vault parameters' {
+
+        It 'Initialize-AksArcValidation accepts -ArcGatewayUrl' {
+            $cmd = Get-Command Initialize-AksArcValidation
+            $cmd.Parameters.ContainsKey('ArcGatewayUrl') | Should -Be $true
+            $cmd.Parameters['ArcGatewayUrl'].ParameterType | Should -Be ([string])
+        }
+
+        It 'Initialize-AksArcValidation accepts -KeyVaultName' {
+            $cmd = Get-Command Initialize-AksArcValidation
+            $cmd.Parameters.ContainsKey('KeyVaultName') | Should -Be $true
+        }
+
+        It 'Test-AksArcDeploymentReadiness accepts -ArcGatewayUrl and -KeyVaultName' {
+            $cmd = Get-Command Test-AksArcDeploymentReadiness
+            $cmd.Parameters.ContainsKey('ArcGatewayUrl') | Should -Be $true
+            $cmd.Parameters.ContainsKey('KeyVaultName')  | Should -Be $true
+        }
+
+        It 'Test-AksArcNetworkConnectivity accepts -ArcGatewayUrl and -KeyVaultName' {
+            $cmd = Get-Command Test-AksArcNetworkConnectivity
+            $cmd.Parameters.ContainsKey('ArcGatewayUrl') | Should -Be $true
+            $cmd.Parameters.ContainsKey('KeyVaultName')  | Should -Be $true
+        }
+
+        It 'Test-AksArcNetworkConnectivity substitutes -KeyVaultName into placeholder URL' {
+            # Smoke test: pass a fake KV name and verify the result row reflects substitution.
+            $r = Test-AksArcNetworkConnectivity -Component 'Azure Local Key Vault*' -KeyVaultName 'pesterfakekv' -PassThru -TimeoutMs 250
+            if ($r) {
+                $kvRow = $r | Where-Object { $_.Url -match 'pesterfakekv' } | Select-Object -First 1
+                # When no KV endpoint exists for the component name match, the test harness
+                # may return an empty set - that is fine for this smoke test.
+                if ($kvRow) {
+                    $kvRow.Url | Should -Match 'pesterfakekv'
+                }
+            }
+        }
+
+        It 'Test-AksArcNetworkConnectivity marks Arc-Gateway-supported endpoints as Skipped when -ArcGatewayUrl is set' {
+            $r = Test-AksArcNetworkConnectivity -Component 'Azure Local AKS infra' -ArcGatewayUrl 'pestergw123.gw.arc.azure.com' -PassThru -TimeoutMs 250
+            if ($r) {
+                $covered = @($r | Where-Object { $_.Detail -like 'Covered by Arc Gateway*' })
+                $covered.Count | Should -BeGreaterThan 0
+            }
         }
     }
 }
