@@ -9,7 +9,10 @@
   <a href="https://www.powershellgallery.com/packages/AksArc.DeploymentReadiness"><img src="https://img.shields.io/powershellgallery/v/AksArc.DeploymentReadiness?label=PSGallery&color=blue" alt="PSGallery"></a>
   <a href="https://www.powershellgallery.com/packages/AksArc.DeploymentReadiness"><img src="https://img.shields.io/powershellgallery/dt/AksArc.DeploymentReadiness?color=green" alt="Downloads"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/smitzlroy/AksArc.DeploymentReadiness" alt="License"></a>
+  <img src="https://img.shields.io/badge/status-feature--complete%20%7C%20parked-lightgrey" alt="Status: feature-complete | parked">
 </p>
+
+> **Project status (April 2026):** v0.8.3 is feature-complete for the use cases the module was built to solve (pre-flight network / endpoint / IP / RBAC validation for AKS Arc on Azure Local). It is **parked, not abandoned** — validated end-to-end on a real Azure Local cluster and stable. Active development has stopped while attention moves to adjacent gaps in the Azure Local + AKS Arc tool chain (Day-2 operations, forensics). Expect to see this picked up again when a customer scenario or a deployment issue calls for it. Issues and PRs are still welcome and will be triaged.
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> &bull;
