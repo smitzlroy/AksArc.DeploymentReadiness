@@ -3,7 +3,7 @@
     # Generated on: 2026-04-15
 
     RootModule        = 'AksArc.DeploymentReadiness.psm1'
-    ModuleVersion     = '0.8.2'
+    ModuleVersion     = '0.8.3'
     GUID              = 'a3e7c1d9-4f2b-4e8a-9d6c-1b5f3e7a2c4d'
     Author            = 'smitzlroy'
     CompanyName       = 'Community'
@@ -38,7 +38,7 @@
             Tags         = @('AKS', 'AKS-Arc', 'Azure-Local', 'Azure-Stack-HCI', 'Readiness', 'Validation', 'Firewall', 'Endpoints', 'Fleet', 'OT')
             LicenseUri   = 'https://github.com/smitzlroy/AksArc.DeploymentReadiness/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/smitzlroy/AksArc.DeploymentReadiness'
-            ReleaseNotes = 'v0.8.2: Arc Gateway and Key Vault awareness. (1) Get-AksArcLocalContext now reads gatewayUrl / connectionType from azcmagent show -j (and azcmagent config get connection.type as a fallback) so the module knows when traffic is tunneled through Arc Gateway. (2) New parameters -ArcGatewayUrl and -KeyVaultName on Initialize-AksArcValidation and Test-AksArcDeploymentReadiness. (3) When Arc Gateway is configured, endpoints flagged arcGatewaySupported=true are marked Skipped ("Covered by Arc Gateway") instead of being tested individually and falsely failing. The gateway URL placeholder ''<your-arc-gateway-id>.gw.arc.azure.com'' is replaced with the real hostname and tested. (4) Same pattern for Key Vault: -KeyVaultName replaces ''<your-keyvault-name>.vault.azure.net'' with the real value. (5) New Gate 0 ArcGateway check records the connection mode (Passed when gateway is in use, Skipped when direct).'
+            ReleaseNotes = 'v0.8.3: Fixes from real-node validation. (1) Per-RP api-version map: Microsoft.ResourceConnector/appliances now uses 2022-10-27 and Microsoft.ExtendedLocation/customLocations uses 2021-08-15 (the global 2025-10-01 default returned NoRegisteredProviderFound for these RPs in westeurope). New Get-ApiVersionForUri helper picks the right version per resource type. (2) Gate 5 LNet detail: az stack-hci-vm network lnet show now uses --name (and --ids when available) instead of -n, which the extension does not alias. (3) Gate 8 RBAC: when az is logged in via az login --identity, account show returns user.name=systemAssignedIdentity which is not a valid --assignee value. The gate now resolves the Arc machine MSI principalId by reading the local Microsoft.HybridCompute/machines resource (machineName + RG come from azcmagent show -j via Get-AksArcLocalContext) and uses that oid for role assignment lookup. If the principalId cannot be resolved, the gate now Skips with specific guidance rather than producing a false-negative FAIL. (4) Get-AksArcLocalContext exposes new MachineName and MachineResourceGroup fields.'
         }
     }
 }

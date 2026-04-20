@@ -14,6 +14,20 @@
 
 $script:ModuleRoot = $PSScriptRoot
 $script:ApiVersion = '2025-10-01'
+# Per-RP api versions where the global default is not registered in all regions.
+# Discovered via 'NoRegisteredProviderFound' errors in westeurope (Azure Local).
+$script:ApiVersionMap = @{
+    'microsoft.resourceconnector/appliances'   = '2022-10-27'
+    'microsoft.extendedlocation/customlocations' = '2021-08-15'
+    'microsoft.hybridcompute/machines'         = '2024-07-10'
+}
+function Get-ApiVersionForUri {
+    param([string]$Uri)
+    foreach ($k in $script:ApiVersionMap.Keys) {
+        if ($Uri -match [regex]::Escape($k)) { return $script:ApiVersionMap[$k] }
+    }
+    return $script:ApiVersion
+}
 $script:LogFilePath = $null
 
 # =============================================================================
@@ -244,6 +258,10 @@ function Get-AksArcLocalContext {
         ClusterName       = $null
         Location          = $null
         NodeName          = $env:COMPUTERNAME
+        # Arc machine resource (Microsoft.HybridCompute/machines) - needed to look up
+        # this node's MSI principalId when az is logged in via 'az login --identity'.
+        MachineName          = $null
+        MachineResourceGroup = $null
         Source            = $null
         # Arc Gateway / proxy info from `azcmagent show -j`. Customers using Arc
         # Gateway only need ~7 outbound endpoints; the rest are tunneled. We surface
@@ -324,6 +342,15 @@ function Get-AksArcLocalContext {
     $result.AgentVersion      = $agent.agentVersion
     $result.AgentStatus       = $agent.status
     $result.UpstreamProxy     = $agent.upstreamProxy
+    # Arc machine resource name (azcmagent reports this as 'resourceName').
+    if ($agent.PSObject.Properties.Name -contains 'resourceName' -and $agent.resourceName) {
+        $result.MachineName = [string]$agent.resourceName
+    } elseif ($agent.PSObject.Properties.Name -contains 'machineName' -and $agent.machineName) {
+        $result.MachineName = [string]$agent.machineName
+    } else {
+        $result.MachineName = $env:COMPUTERNAME
+    }
+    $result.MachineResourceGroup = $rg
 
     # Arc Gateway detection. azcmagent JSON varies by agent version - check several
     # likely field names. The gateway URL ends in '.gw.arc.azure.com'.
@@ -376,9 +403,10 @@ function Invoke-AzRestCall {
     param(
         [string]$Uri,
         [string]$Method = 'GET',
-        [string]$ApiVersion = $script:ApiVersion,
+        [string]$ApiVersion,
         [switch]$ThrowOnError
     )
+    if (-not $ApiVersion) { $ApiVersion = Get-ApiVersionForUri -Uri $Uri }
     $fullUri = "https://management.azure.com${Uri}?api-version=$ApiVersion"
     $result = Invoke-AzCliJson "rest --method $Method --uri `"$fullUri`""
     if (-not $result) {
@@ -1583,7 +1611,13 @@ function Test-AksArcDeploymentReadiness {
             Write-Log "  $($Context.LogicalNetworks.Count) logical network(s) found" -Level Success
 
             foreach ($lnet in $Context.LogicalNetworks) {
-                $lnetObj = Invoke-AzCliJson "stack-hci-vm network lnet show -g $($Context.ResourceGroup) -n $($lnet.name)"
+                # Use --name (not -n); az stack-hci-vm network lnet show does not alias -n.
+                # Prefer --ids when the list call returned a full ARM id (most reliable across CLI versions).
+                if ($lnet.id) {
+                    $lnetObj = Invoke-AzCliJson "stack-hci-vm network lnet show --ids `"$($lnet.id)`""
+                } else {
+                    $lnetObj = Invoke-AzCliJson "stack-hci-vm network lnet show --resource-group $($Context.ResourceGroup) --name $($lnet.name)"
+                }
                 if ($lnetObj) {
                     $provState = $lnetObj.properties.provisioningState
 
@@ -1849,19 +1883,47 @@ function Test-AksArcDeploymentReadiness {
 
         $rbacPassed = $true
         try {
-            # Get current identity
+            # Get current identity. When 'az login --identity' was used on an Arc-enabled
+            # machine, account show returns user.name='systemAssignedIdentity' which is NOT
+            # a valid --assignee value; we have to resolve the actual principalId from the
+            # local Arc machine resource.
             $caller = Invoke-AzCliJson 'account show'
             $callerType = $caller.user.type  # 'user' or 'servicePrincipal'
             $callerName = $caller.user.name
+            $assigneeId = $callerName
+            $assigneeLabel = $callerName
+            if ($callerName -eq 'systemAssignedIdentity') {
+                $localCtx = $null
+                try { $localCtx = Get-AksArcLocalContext -ErrorAction Stop } catch { }
+                if ($localCtx -and $localCtx.MachineName -and $localCtx.MachineResourceGroup) {
+                    $machineUri = "/subscriptions/$($localCtx.SubscriptionId)/resourceGroups/$($localCtx.MachineResourceGroup)/providers/Microsoft.HybridCompute/machines/$($localCtx.MachineName)"
+                    $machine = Invoke-AzRestCall -Uri $machineUri
+                    if ($machine -and $machine.identity -and $machine.identity.principalId) {
+                        $assigneeId = $machine.identity.principalId
+                        $assigneeLabel = "$($localCtx.MachineName) (Arc machine MSI, oid=$assigneeId)"
+                        Write-Log "  Resolved Arc machine MSI principalId: $assigneeId" -Level Info
+                    } else {
+                        Write-Log "  Could not resolve Arc machine MSI principalId; RBAC check will be skipped." -Level Warning
+                    }
+                }
+            }
 
             # Get role assignments at resource group scope
             $rgScope = "/subscriptions/$($Context.SubscriptionId)/resourceGroups/$($Context.ResourceGroup)"
-            $assignments = Invoke-AzCliJson "role assignment list --scope `"$rgScope`" --assignee `"$callerName`""
+            if ($assigneeId -eq 'systemAssignedIdentity') {
+                # Could not resolve - skip with guidance instead of producing a false negative.
+                $results += New-ValidationResult -Gate 'RBAC' -Check 'DeploymentPermissions' -Status 'Skipped' `
+                    -Message 'Cannot evaluate RBAC: caller is the Arc machine MSI but principalId could not be resolved' `
+                    -Detail 'Run az login with a user account, or grant Reader on the Arc machine resource so the principalId can be read.' `
+                    -Remediation 'Either (a) az login --tenant <tenant> with a user account that has Reader on the RG, or (b) ensure this machine has Reader on its own Microsoft.HybridCompute/machines resource so its identity.principalId is readable.'
+                return $results
+            }
+            $assignments = Invoke-AzCliJson "role assignment list --scope `"$rgScope`" --assignee `"$assigneeId`""
             if (-not $assignments) { $assignments = @() }
 
             $roleNames = @($assignments | ForEach-Object { $_.roleDefinitionName }) | Select-Object -Unique
 
-            Write-Log "  Identity: $callerName ($callerType)" -Level Info
+            Write-Log "  Identity: $assigneeLabel ($callerType)" -Level Info
             Write-Log "  Roles at RG scope: $($roleNames -join ', ')" -Level Info
 
             # Check for sufficient permissions via well-known roles
